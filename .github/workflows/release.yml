@@ -66,6 +66,9 @@ jobs:
           $portableDir = "dist-portable/LocalVaultDesk_Portable"
           New-Item -ItemType Directory -Path $portableDir -Force
           Copy-Item -LiteralPath "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" -Destination "$portableDir/LocalVaultDesk.exe" -Force
+          if (Test-Path "bin/WebView2Loader.dll") {
+            Copy-Item -LiteralPath "bin/WebView2Loader.dll" -Destination "$portableDir/WebView2Loader.dll" -Force
+          }
           Compress-Archive -Path "$portableDir/*" -DestinationPath "dist-portable/LocalVaultDesk_${ver}_Portable_x64.zip" -Force
 
       - name: Run Test Verification
