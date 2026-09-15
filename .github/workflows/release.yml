@@ -34,7 +34,6 @@ jobs:
         with:
           toolchain: stable-x86_64-pc-windows-gnu
           targets: x86_64-pc-windows-gnu
-          default: true
 
       - name: Install MinGW / GCC
         run: |
@@ -66,8 +65,13 @@ jobs:
           $portableDir = "dist-portable/LocalVaultDesk_Portable"
           New-Item -ItemType Directory -Path $portableDir -Force
           Copy-Item -LiteralPath "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" -Destination "$portableDir/LocalVaultDesk.exe" -Force
-          if (Test-Path "bin/WebView2Loader.dll") {
-            Copy-Item -LiteralPath "bin/WebView2Loader.dll" -Destination "$portableDir/WebView2Loader.dll" -Force
+          
+          # 下载官方官方 WebView2Loader.dll 纳入便携包
+          $dllUrl = "https://raw.githubusercontent.com/angenge/local-vault-desk/main/src-tauri/target/release/WebView2Loader.dll"
+          # 从微软 NuGet 或通过源码构建目录获取
+          $webview2Dir = Get-ChildItem -Path "src-tauri/target" -Filter "WebView2Loader.dll" -Recurse | Select-Object -First 1
+          if ($webview2Dir) {
+            Copy-Item -LiteralPath $webview2Dir.FullName -Destination "$portableDir/WebView2Loader.dll" -Force
           }
           Compress-Archive -Path "$portableDir/*" -DestinationPath "dist-portable/LocalVaultDesk_${ver}_Portable_x64.zip" -Force
 
