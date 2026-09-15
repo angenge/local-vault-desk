@@ -1,0 +1,85 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: 'src-tauri/librclone_src/go.sum'
+
+      - name: Setup Rust toolchain (GNU)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MinGW / GCC
+        run: |
+          choco install mingw -y --no-progress
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build librclone.a C-Archive
+        run: |
+          New-Item -ItemType Directory -Path "src-tauri/lib" -Force
+          cd src-tauri/librclone_src
+          go build -buildmode=c-archive -o ../lib/librclone.a .
+          cd ../..
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri Desktop Application
+        run: |
+          npm run tauri -- build --target x86_64-pc-windows-gnu
+
+      - name: Create Portable Bundle
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if (-not $ver) { $ver = "v1.0.0" }
+          $portableDir = "dist-portable/LocalVaultDesk_Portable"
+          New-Item -ItemType Directory -Path $portableDir -Force
+          Copy-Item -LiteralPath "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" -Destination "$portableDir/LocalVaultDesk.exe" -Force
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "dist-portable/LocalVaultDesk_${ver}_Portable_x64.zip" -Force
+
+      - name: Run Test Verification
+        run: |
+          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-cli
+          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-features
+          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-security
+          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-fuzz
+          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-fix-regression
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist-portable/*.zip
+            src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-gnu/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe
+          generate_release_notes: true

@@ -1,0 +1,2 @@
+# [package.metadata.winres]
+# 包含延迟加载 WebView2Loader.dll 的支持

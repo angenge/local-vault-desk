@@ -1,0 +1,39 @@
+# Node / Vite
+node_modules/
+dist/
+npm-debug.log*
+
+# Rust / Tauri (build artifacts)
+src-tauri/target/
+src-tauri/gen/schemas
+src-tauri/.tauri/
+
+# 二进制产物 / 第三方二进制
+bin/
+src-tauri/lib/*.a
+src-tauri/lib/*.dll
+src-tauri/lib/*.so
+src-tauri/lib/*.dylib
+src-tauri/librclone_src/librclone/*.a
+
+# 便携版发布产物
+dist-portable/
+
+# IDE / OS / 日志
+.vscode/
+.idea/
+*.swp
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 凭据与敏感文件
+*.pem
+*.key
+.env
+
+# 忽略除 README.md 外的其他所有 Markdown 文档与 docs 目录
+*.md
+!README.md
+docs/
