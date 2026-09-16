@@ -1,13 +1,16 @@
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-/// 本地/局域网安全流媒体微服务，
-/// 支持绑定 127.0.0.1 (纯本机) 或 0.0.0.0 (局域网共享)，
-/// 结合 32 字节随机会话 Token 鉴权，支持全套 HTTP 1.1 Range 分块，
-/// 锁定/退出时物理停机销毁。
+/// 本地/局域网安全流媒体微服务。
+///
+/// 功能要点：
+/// - 绑定 127.0.0.1（纯本机）或 0.0.0.0（局域网共享），32 字节 Hex 会话 Token 鉴权；
+/// - 完整 HTTP/1.1 Range（支持单区间/负区间/HEAD），Content-Range 总长按真实文件大小回填；
+/// - 随机读取基于解密缓存（见 RcloneService::read_file_stream_range），seek 不再全量重解；
+/// - 锁定/退出时物理停机销毁。
 pub struct MediaStreamServer {
     bind_ip: IpAddr,
     port: u16,
@@ -15,10 +18,22 @@ pub struct MediaStreamServer {
     running: Arc<AtomicBool>,
 }
 
+/// 一次随机范围读取的结果：实际起始偏移（负区间解析后）、读取到的字节、文件总大小。
+pub type StreamReadResult = (u64, Vec<u8>, u64);
+
 impl MediaStreamServer {
-    pub fn start<F>(allow_lan: bool, read_range_fn: F) -> Result<Self, String>
+    /// 启动流媒体服务。
+    ///
+    /// - `get_size_fn`：按远程路径获取明文（解密后）文件总大小，用于回填 Content-Length/Content-Range。
+    /// - `read_range_fn`：按下述签名做解密后随机读取，返回 (实际起始偏移, 字节, 文件总大小)。
+    pub fn start<F, G>(
+        allow_lan: bool,
+        get_size_fn: G,
+        read_range_fn: F,
+    ) -> Result<Self, String>
     where
-        F: Fn(&str, u64, u64) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+        F: Fn(&str, u64, u64) -> Result<StreamReadResult, String> + Send + Sync + 'static,
+        G: Fn(&str) -> Result<u64, String> + Send + Sync + 'static,
     {
         let bind_ip: IpAddr = if allow_lan {
             IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
@@ -33,12 +48,13 @@ impl MediaStreamServer {
             .map_err(|e| format!("获取本地端口失败: {}", e))?;
         let port = addr.port();
 
-        // 生成高强度 32 字节 Hex 随机 Token
+        // 高强度 32 字节 CSPRNG Hex 随机 Token
         let token = generate_random_token();
         let running = Arc::new(AtomicBool::new(true));
 
         let running_clone = running.clone();
         let token_clone = token.clone();
+        let get_size = Arc::new(get_size_fn);
         let read_fn = Arc::new(read_range_fn);
 
         listener
@@ -54,8 +70,9 @@ impl MediaStreamServer {
                     Ok(stream) => {
                         let tok = token_clone.clone();
                         let r_fn = read_fn.clone();
+                        let g_fn = get_size.clone();
                         thread::spawn(move || {
-                            let _ = handle_client(stream, &tok, r_fn);
+                            let _ = handle_client(stream, &tok, r_fn, g_fn);
                         });
                     }
                     Err(_) => {
@@ -120,30 +137,55 @@ impl Drop for MediaStreamServer {
     }
 }
 
-/// 自动探测当前机器连接活跃局域网网络的实际 IPv4 地址（如 192.168.x.x）
+/// 自动探测本机活跃局域网 IPv4：遍历本机所有网卡接口，
+/// 跳过回环与链路本地地址，优先选择 IPv4 私网地址。
+/// 不依赖任何外网可达性，国内网络同样准确。
 pub fn get_local_lan_ip() -> Option<String> {
-    // 建立一个伪 UDP socket（不实际发送数据包）以让操作系统路由表选择默认的出口网卡 IP
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let local_addr = socket.local_addr().ok()?;
-    Some(local_addr.ip().to_string())
+    use std::net::Ipv4Addr;
+    let addrs = if_addrs::get_if_addrs().ok()?;
+    let mut candidates: Vec<String> = addrs
+        .into_iter()
+        .filter_map(|a| match a.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .filter(|ip: &Ipv4Addr| !ip.is_loopback() && !ip.is_link_local())
+        .map(|ip| ip.to_string())
+        .collect();
+    // 优先返回私网地址（192.168.x / 10.x / 172.16~31.x），避免 VPN 虚拟网卡等干扰顺序
+    candidates.sort_by_key(|ip| {
+        let is_private = ip.starts_with("192.168.")
+            || ip.starts_with("10.")
+            || (ip.starts_with("172.") && {
+                let oct: u16 = ip.split('.').nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                (16..=31).contains(&oct)
+            });
+        !is_private
+    });
+    candidates.into_iter().next()
 }
 
+/// 使用操作系统 CSPRNG 生成 32 字节 Hex 随机 Token
 fn generate_random_token() -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(std::process::id().to_ne_bytes());
-    h.update(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_ne_bytes(),
-    );
-    let extra = [0u8; 16];
-    let ptr = &extra as *const _ as usize;
-    h.update(ptr.to_ne_bytes());
-    hex::encode(h.finalize())
+    let mut buf = [0u8; 32];
+    // getrandom 失败（极罕见）时退化为时间戳+栈地址哈希，避免完全无法启动
+    if getrandom::getrandom(&mut buf).is_err() {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(std::process::id().to_ne_bytes());
+        h.update(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_ne_bytes(),
+        );
+        let extra = [0u8; 16];
+        let ptr = &extra as *const _ as usize;
+        h.update(ptr.to_ne_bytes());
+        return hex::encode(h.finalize());
+    }
+    hex::encode(buf)
 }
 
 fn percent_encode_path(s: &str) -> String {
@@ -179,14 +221,20 @@ fn percent_decode(s: &str) -> Result<String, ()> {
     String::from_utf8(bytes).map_err(|_| ())
 }
 
-fn handle_client<F>(mut stream: TcpStream, valid_token: &str, read_fn: Arc<F>) -> std::io::Result<()>
+fn handle_client<F, G>(
+    mut stream: TcpStream,
+    valid_token: &str,
+    read_fn: Arc<F>,
+    get_size_fn: Arc<G>,
+) -> std::io::Result<()>
 where
-    F: Fn(&str, u64, u64) -> Result<Vec<u8>, String>,
+    F: Fn(&str, u64, u64) -> Result<StreamReadResult, String> + Send + Sync + 'static,
+    G: Fn(&str) -> Result<u64, String> + Send + Sync + 'static,
 {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
 
-    let mut header_buf = [0u8; 4096];
+    let mut header_buf = [0u8; 8192];
     let n = stream.read(&mut header_buf)?;
     if n == 0 {
         return Ok(());
@@ -218,10 +266,10 @@ where
         None => (full_path, ""),
     };
 
-    // 强 Token 鉴权：局域网/本机请求均必须携带匹配的 32 字节会话 Token
+    // 强 Token 鉴权：局域网/本机请求均必须携带匹配的会话 Token
     let token_ok = query_str
         .split('&')
-        .any(|p| p.starts_with("token=") && &p[6..] == valid_token);
+        .any(|p| p.strip_prefix("token=") == Some(valid_token));
 
     if !token_ok {
         let resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\n403 Access Denied";
@@ -245,6 +293,22 @@ where
         }
     };
 
+    let mime_type = get_mime_by_filename(&file_path);
+
+    // 获取真实文件总大小（解密后明文长度），用于 Content-Length / Content-Range 回填
+    let total = match get_size_fn(&file_path) {
+        Ok(total) => total,
+        Err(e) => {
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                e.len(),
+                e
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            return Ok(());
+        }
+    };
+
     let mut range_header: Option<&str> = None;
     for line in lines {
         if line.to_lowercase().starts_with("range:") {
@@ -253,28 +317,60 @@ where
         }
     }
 
-    let mime_type = get_mime_by_filename(&file_path);
-    let default_chunk_size = 2 * 1024 * 1024u64;
-
+    // 解析 Range：支持单区间、负区间后缀（bytes=-N）；多区间暂不支持，回退整体读取
     if let Some(range_str) = range_header {
-        if let Some((start, end_opt)) = parse_http_range(range_str) {
-            let chunk_len = match end_opt {
-                Some(end) => (end - start + 1).min(default_chunk_size),
-                None => default_chunk_size,
+        let parsed = parse_http_range(range_str);
+        // 多区间（含逗号）或无法解析：忽略 Range 头，走整体读取
+        if range_str.contains(',') {
+            // 直接按整体读取处理
+        } else if let Some((start, end_opt)) = parsed {
+            let start = match start {
+                RangeStart::Suffix(n) => {
+                    if n == 0 || total == 0 {
+                        // 无内容
+                        let _ = stream.write_all(
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\n\r\n"
+                                .as_bytes(),
+                        );
+                        return Ok(());
+                    }
+                    total.saturating_sub(n)
+                }
+                RangeStart::Offset(s) => s,
             };
 
-            match read_fn(&file_path, start, chunk_len) {
-                Ok(data) => {
-                    let actual_len = data.len() as u64;
-                    if actual_len == 0 {
-                        let resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */*\r\nContent-Length: 0\r\n\r\n";
+            if start >= total && total > 0 {
+                let resp = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                    total
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                return Ok(());
+            }
+
+            // 计算读取量：显式 end 优先，其次默认 4MB 分块；均以文件总长为上界
+            let default_chunk = 4 * 1024 * 1024u64;
+            let want_len = match end_opt {
+                Some(end) => end.saturating_sub(start).saturating_add(1),
+                None => default_chunk,
+            };
+            let want_len = want_len.min(total.saturating_sub(start)).max(1);
+
+            match read_fn(&file_path, start, want_len) {
+                Ok((actual_start, data, actual_total)) => {
+                    if data.is_empty() {
+                        let resp = format!(
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                            actual_total
+                        );
                         let _ = stream.write_all(resp.as_bytes());
                         return Ok(());
                     }
-                    let actual_end = start + actual_len - 1;
+                    let actual_len = data.len() as u64;
+                    let actual_end = actual_start + actual_len - 1;
                     let resp_header = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/200000000000\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-                        mime_type, start, actual_end, actual_len
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                        mime_type, actual_start, actual_end, actual_total, actual_len
                     );
                     let _ = stream.write_all(resp_header.as_bytes());
                     if method == "GET" {
@@ -283,7 +379,11 @@ where
                     return Ok(());
                 }
                 Err(e) => {
-                    let resp = format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}", e.len(), e);
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                        e.len(),
+                        e
+                    );
                     let _ = stream.write_all(resp.as_bytes());
                     return Ok(());
                 }
@@ -291,40 +391,81 @@ where
         }
     }
 
-    match read_fn(&file_path, 0, 4 * 1024 * 1024) {
-        Ok(data) => {
-            let resp_header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-                mime_type, data.len()
-            );
-            let _ = stream.write_all(resp_header.as_bytes());
-            if method == "GET" {
-                let _ = stream.write_all(&data);
+    // 无 Range（或 Range 无法解析）：小文件整体返回，大文件回 416 逼播放器改用 Range 切片
+    if total > 0 && total <= 4 * 1024 * 1024u64 {
+        match read_fn(&file_path, 0, total) {
+            Ok((_, data, _)) => {
+                let resp_header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                    mime_type,
+                    data.len()
+                );
+                let _ = stream.write_all(resp_header.as_bytes());
+                if method == "GET" {
+                    let _ = stream.write_all(&data);
+                }
+            }
+            Err(e) => {
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    e.len(),
+                    e
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
         }
-        Err(e) => {
-            let resp = format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}", e.len(), e);
-            let _ = stream.write_all(resp.as_bytes());
-        }
+    } else if total == 0 {
+        let resp_header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            mime_type
+        );
+        let _ = stream.write_all(resp_header.as_bytes());
+    } else {
+        // 大文件且未带 Range：回 416 并告知真实总长，播放器随即改用 Range 请求
+        let resp = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+            total
+        );
+        let _ = stream.write_all(resp.as_bytes());
     }
 
     Ok(())
 }
 
-fn parse_http_range(range_header: &str) -> Option<(u64, Option<u64>)> {
+enum RangeStart {
+    Offset(u64),
+    Suffix(u64),
+}
+
+/// 解析 HTTP Range（单区间）：`bytes=0-99`、`bytes=100-`、`bytes=-500`
+fn parse_http_range(range_header: &str) -> Option<(RangeStart, Option<u64>)> {
     let stripped = range_header.trim().strip_prefix("bytes=")?;
     let parts: Vec<&str> = stripped.split('-').collect();
-    if parts.is_empty() {
+    if parts.is_empty() || parts.len() > 2 {
         return None;
     }
-    let start_str = parts[0].trim();
-    let start: u64 = start_str.parse().ok()?;
-    let end: Option<u64> = if parts.len() > 1 && !parts[1].trim().is_empty() {
-        parts[1].trim().parse().ok()
+    let first = parts[0].trim();
+    let second = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+    if first.is_empty() {
+        // 后缀区间 bytes=-N
+        let n: u64 = second.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some((RangeStart::Suffix(n), None))
     } else {
-        None
-    };
-    Some((start, end))
+        let start: u64 = first.parse().ok()?;
+        let end: Option<u64> = if second.is_empty() {
+            None
+        } else {
+            match second.parse::<u64>() {
+                Ok(e) if e >= start => Some(e),
+                _ => return None,
+            }
+        };
+        Some((RangeStart::Offset(start), end))
+    }
 }
 
 fn get_mime_by_filename(name: &str) -> &'static str {

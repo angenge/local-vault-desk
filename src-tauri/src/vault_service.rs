@@ -415,6 +415,7 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         let content = self.rclone.read_text_file(name)?;
         // 外部 rclone 可能刚刚写入新文件，失效搜索快照保证后续能检索到
         self.rclone.invalidate_search_index();
+        self.rclone.invalidate_stream_cache();
         Ok(content)
     }
 
@@ -451,6 +452,8 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         if res.is_ok() {
             // 外部写入即保险箱数据变化，失效搜索快照避免旧结果残留
             self.rclone.invalidate_search_index();
+            // 同名文件可能已被外部覆盖，流媒体解密缓存一并失效，防止读到旧明文
+            self.rclone.invalidate_stream_cache();
         }
         res
     }
@@ -732,6 +735,15 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         if is_internal_control(vault_item_path) {
             return Err("内部管控文件不可预览".into());
         }
+        // 体积熔断：无论调用方传多大，预览最多只缓存 200MB 明文到内存，
+        // 超过阈值直接拒绝而非截断返回，杜绝误读大文件导致内存暴涨
+        const PREVIEW_HARD_CAP: usize = 200 * 1024 * 1024;
+        if max_bytes > PREVIEW_HARD_CAP {
+            return Err(format!(
+                "预览体积已超过 {} MB 熔断上限，请使用流媒体模式播放",
+                PREVIEW_HARD_CAP / 1024 / 1024
+            ));
+        }
         self.rclone.read_file_range_bytes(vault_item_path, 0, max_bytes as u64)
     }
 
@@ -782,10 +794,17 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
     /// 根据局域网开关启动或切换流媒体微服务 (allow_lan: true 监听 0.0.0.0, false 仅监听 127.0.0.1)
     pub fn restart_stream_server_with_lan(&self, allow_lan: bool) -> Result<(), String> {
         self.stop_stream_server();
-        let rclone_clone = self.rclone.clone();
-        match MediaStreamServer::start(allow_lan, move |path, start, len| {
-            rclone_clone.read_file_range_bytes(path, start, len)
-        }) {
+        // 清空解密缓存：流媒体服务重启意味着可能切换了加密通道或锁定/解锁
+        self.rclone.invalidate_stream_cache();
+        let rclone_size = self.rclone.clone();
+        let rclone_read = self.rclone.clone();
+        match MediaStreamServer::start(
+            allow_lan,
+            move |path: &str| -> Result<u64, String> { rclone_size.stat_stream_total(path) },
+            move |path: &str, start: u64, len: u64| -> Result<crate::stream_server::StreamReadResult, String> {
+                rclone_read.read_file_stream_range(path, start, len)
+            },
+        ) {
             Ok(server) => {
                 *self.stream_server.lock().unwrap() = Some(server);
                 Ok(())

@@ -89,6 +89,9 @@ pub struct RcloneService {
     cancel_requested: Mutex<bool>,
     // 标记当前是否已成功挂载保险箱（加密通道就绪）；锁定/切换后置 false
     mounted: Mutex<bool>,
+    // 解密后流媒体临时文件缓存：remote 路径 -> 明文临时文件绝对路径
+    // seek 时只做一次全量解密，之后直接随机读，避免每次 Range 都全量重解
+    stream_cache: Mutex<std::collections::HashMap<String, PathBuf>>,
 }
 
 /// 保险箱内部鉴权标记文件名（磁盘上为密文，解密后用于校验解锁）
@@ -202,6 +205,7 @@ impl RcloneService {
             active_job: Mutex::new(None),
             cancel_requested: Mutex::new(false),
             mounted: Mutex::new(false),
+            stream_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -338,6 +342,7 @@ impl RcloneService {
         *self.mounted.lock().unwrap() = false;
         // 保险箱切换/锁定时清空搜索快照与回收站元数据缓存，防止旧保险箱元数据残留污染
         self.invalidate_search_index();
+        self.invalidate_stream_cache();
         self.recycle_meta_cache.lock().unwrap().clear();
         *self.raw_remote.lock().unwrap() = String::new();
         let _ = self.call_rc("config/delete", serde_json::json!({ "name": "vault_crypt" }));
@@ -546,16 +551,16 @@ impl RcloneService {
         read_res
     }
 
-    /// 读取文件指定范围的二进制字节数据（流式 Range 边播边解密，绝不全量加载 1GB 到内存）
-    pub fn read_file_range_bytes(&self, remote_path: &str, start: u64, length: u64) -> Result<Vec<u8>, String> {
-        use std::io::{Read, Seek, SeekFrom};
+    /// 解密整个文件到私有临时目录（流媒体缓存/预览共用）。
+    /// 返回 (临时文件绝对路径, 明文总字节数)。
+    fn decrypt_to_private_tmp(&self, remote_path: &str) -> Result<(PathBuf, u64), String> {
         let clean_path = remote_path.trim_start_matches('/');
         let temp_dir = private_tmp_dir();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temp_file = temp_dir.join(format!("_vault_stream_{}_{}.tmp", std::process::id(), ts));
+        let temp_file = temp_dir.join(format!("_vault_stream_cache_{}_{}.tmp", std::process::id(), ts));
 
         let dst_dir = temp_file
             .parent()
@@ -564,7 +569,7 @@ impl RcloneService {
         let dst_file = temp_file
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "_vault_stream.tmp".to_string());
+            .unwrap_or_else(|| "_vault_stream_cache.tmp".to_string());
 
         let res = self.call_rc(
             "operations/copyfile",
@@ -576,24 +581,82 @@ impl RcloneService {
             }),
         );
 
-        let read_res = match res {
+        match res {
             Ok(_) => {
-                let mut file = fs::File::open(&temp_file).map_err(|e| e.to_string())?;
-                let file_len = file.metadata().map_err(|e| e.to_string())?.len();
-                if start >= file_len {
-                    Ok(Vec::new())
-                } else {
-                    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-                    let to_read = length.min(file_len - start) as usize;
-                    let mut buffer = vec![0u8; to_read];
-                    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
-                    Ok(buffer)
-                }
+                let len = fs::metadata(&temp_file).map_err(|e| e.to_string())?.len();
+                Ok((temp_file, len))
             }
-            Err(e) => Err(e),
-        };
-        let _ = fs::remove_file(&temp_file);
-        read_res
+            Err(e) => {
+                let _ = fs::remove_file(&temp_file);
+                Err(e)
+            }
+        }
+    }
+
+    /// 获取解码缓存中指定的临时文件路径（解密后明文，一次性全量解密）
+    fn stream_cache_path(&self, remote_path: &str) -> Option<PathBuf> {
+        self.stream_cache.lock().unwrap().get(remote_path).cloned()
+    }
+
+    /// 清理全部流媒体缓存（锁定/切换/文件变更后调用）
+    pub fn invalidate_stream_cache(&self) {
+        let removed: Vec<PathBuf> = self.stream_cache.lock().unwrap().drain().map(|(_, p)| p).collect();
+        for p in removed {
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    /// 读取文件指定范围的二进制字节数据（带解密缓存：同一文件只全量解密一次，
+    /// 后续任意偏移 seek 均为直接磁盘随机读，毫秒级返回）。
+    pub fn read_file_range_bytes(&self, remote_path: &str, start: u64, length: u64) -> Result<Vec<u8>, String> {
+        self.read_file_stream_range(remote_path, start, length).map(|(_, bytes, _)| bytes)
+    }
+
+    /// 流式随机读取：返回 (实际起始偏移, 读取到的字节, 文件明文总大小)。
+    /// 首次访问某文件时全量解密到私有临时目录并缓存，之后全部直接按偏移读取。
+    pub fn read_file_stream_range(&self, remote_path: &str, start: u64, length: u64) -> Result<crate::stream_server::StreamReadResult, String> {
+        let clean_path = remote_path.trim_start_matches('/');
+        if clean_path.is_empty() {
+            return Err("文件路径为空".into());
+        }
+
+        // 1. 命中缓存：直接随机读
+        if let Some(cached) = self.stream_cache_path(clean_path) {
+            return Self::read_slice_from_file(&cached, start, length);
+        }
+
+        // 2. 未命中：全量解密一次并写入缓存
+        let (tmp_file, _) = self.decrypt_to_private_tmp(clean_path)?;
+        self.stream_cache.lock().unwrap().insert(clean_path.to_string(), tmp_file.clone());
+        Self::read_slice_from_file(&tmp_file, start, length)
+    }
+
+    /// 获取指定明文文件的解密后总大小（无缓存时触发一次全量解密并缓存）
+    pub fn stat_stream_total(&self, remote_path: &str) -> Result<u64, String> {
+        let clean_path = remote_path.trim_start_matches('/');
+        if clean_path.is_empty() {
+            return Err("文件路径为空".into());
+        }
+        if let Some(cached) = self.stream_cache_path(clean_path) {
+            return fs::metadata(&cached).map(|m| m.len()).map_err(|e| e.to_string());
+        }
+        let (tmp_file, len) = self.decrypt_to_private_tmp(clean_path)?;
+        self.stream_cache.lock().unwrap().insert(clean_path.to_string(), tmp_file);
+        Ok(len)
+    }
+
+    fn read_slice_from_file(path: &std::path::Path, start: u64, length: u64) -> Result<crate::stream_server::StreamReadResult, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        if start >= file_len || length == 0 {
+            return Ok((0, Vec::new(), file_len));
+        }
+        file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        let to_read = length.min(file_len - start) as usize;
+        let mut buffer = vec![0u8; to_read];
+        file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+        Ok((start, buffer, file_len))
     }
 
     fn run_async_job(&self, task_type: &str, endpoint: &str, params: serde_json::Value) -> Result<(), String> {
@@ -941,6 +1004,7 @@ impl RcloneService {
         }
 
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(())
     }
 
@@ -1108,6 +1172,7 @@ impl RcloneService {
             }),
         )?;
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(())
     }
 
@@ -1131,6 +1196,7 @@ impl RcloneService {
             )?;
         }
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(())
     }
 
@@ -1395,6 +1461,7 @@ impl RcloneService {
         self.recycle_meta_cache.lock().unwrap().insert(ts_num.to_string(), meta_val);
 
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(ts_num.to_string())
     }
 
@@ -1569,6 +1636,7 @@ impl RcloneService {
         self.recycle_meta_cache.lock().unwrap().remove(clean_id);
 
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(true)
     }
 
@@ -1594,6 +1662,7 @@ impl RcloneService {
         let _ = self.make_dir(".recycle");
         self.recycle_meta_cache.lock().unwrap().clear();
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
 
         purge_res.map(|_| true)
     }
@@ -1644,6 +1713,7 @@ impl RcloneService {
         self.move_item_atomic(&remote, &new_remote, is_dir)?;
         self.cleanup_empty_ancestors(&remote)?;
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(true)
     }
 
@@ -1715,6 +1785,7 @@ impl RcloneService {
             count += 1;
         }
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(count)
     }
 
@@ -1771,6 +1842,7 @@ impl RcloneService {
             count += 1;
         }
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(count)
     }
 
@@ -1817,6 +1889,7 @@ impl RcloneService {
         let manifest = serde_json::json!({ "files": mapping });
         self.write_text_file(".manifest", &manifest.to_string())?;
         self.invalidate_search_index();
+         self.invalidate_stream_cache();
         Ok(mapping.len())
     }
 
