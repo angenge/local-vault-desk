@@ -234,13 +234,30 @@ where
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
 
+    // 循环读取直至收齐完整 HTTP 头部（\r\n\r\n）或超限。
+    // 单次 read() 无法保证拿到整份请求：TCP 可能分片，Range 头/请求行可能落在后续分段，
+    // 若忽略会导致播放器误判不支持 seek 而整个文件全量下载，或静默断连。
     let mut header_buf = [0u8; 8192];
-    let n = stream.read(&mut header_buf)?;
-    if n == 0 {
+    let mut buf_len = 0usize;
+    loop {
+        match stream.read(&mut header_buf[buf_len..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf_len += n;
+                if buf_len >= 4 && &header_buf[buf_len - 4..buf_len] == b"\r\n\r\n" {
+                    break;
+                }
+                if buf_len >= header_buf.len() {
+                    break;
+                }
+            }
+        }
+    }
+    if buf_len == 0 {
         return Ok(());
     }
 
-    let req_str = String::from_utf8_lossy(&header_buf[..n]);
+    let req_str = String::from_utf8_lossy(&header_buf[..buf_len]);
     let mut lines = req_str.lines();
     let first_line = match lines.next() {
         Some(l) => l,
@@ -348,46 +365,62 @@ where
                 return Ok(());
             }
 
-            // 计算读取量：显式 end 优先，其次默认 4MB 分块；均以文件总长为上界
-            let default_chunk = 4 * 1024 * 1024u64;
-            let want_len = match end_opt {
-                Some(end) => end.saturating_sub(start).saturating_add(1),
-                None => default_chunk,
-            };
-            let want_len = want_len.min(total.saturating_sub(start)).max(1);
+            // 空文件不存在任何可读区间，一律回 416（与旧实现一致，避免 206 空正文歧义）
+            if total == 0 {
+                let resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+                return Ok(());
+            }
 
-            match read_fn(&file_path, start, want_len) {
-                Ok((actual_start, data, actual_total)) => {
-                    if data.is_empty() {
-                        let resp = format!(
-                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
-                            actual_total
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        return Ok(());
+            // 计算实际响应的区间 [start, end_inclusive]：显式终点向上封顶为文件末尾；
+            // 开放终点(bytes=N-)仅回默认 4MB 分块（有界），由播放器后续按需再请求。
+            let range_end = match end_opt {
+                Some(end) => end.min(total.saturating_sub(1)),
+                None => (4 * 1024 * 1024u64)
+                    .saturating_add(start)
+                    .saturating_sub(1)
+                    .min(total.saturating_sub(1)),
+            };
+            if range_end < start {
+                let resp = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                    total
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                return Ok(());
+            }
+
+            let range_len = range_end - start + 1;
+            let resp_header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                mime_type, start, range_end, total, range_len
+            );
+            let _ = stream.write_all(resp_header.as_bytes());
+            if method == "GET" {
+                // 分块下发：单次峰值 ≤ 4MB。显式终点可能覆盖整个大文件（bytes=0-<size-1>），
+                // 若一次性读入会造成与文件同量级的内存分配，大文件直接进程级 OOM。
+                const CHUNK: u64 = 4 * 1024 * 1024;
+                let mut offset = start;
+                let mut remaining = range_len;
+                while remaining > 0 {
+                    let want = CHUNK.min(remaining);
+                    match read_fn(&file_path, offset, want) {
+                        Ok((actual_start, data, _)) => {
+                            if data.is_empty() {
+                                break;
+                            }
+                            if stream.write_all(&data).is_err() {
+                                break; // 对端提前断开
+                            }
+                            let sent = data.len() as u64;
+                            offset = actual_start + sent;
+                            remaining = remaining.saturating_sub(sent);
+                        }
+                        Err(_) => break,
                     }
-                    let actual_len = data.len() as u64;
-                    let actual_end = actual_start + actual_len - 1;
-                    let resp_header = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-                        mime_type, actual_start, actual_end, actual_total, actual_len
-                    );
-                    let _ = stream.write_all(resp_header.as_bytes());
-                    if method == "GET" {
-                        let _ = stream.write_all(&data);
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    let resp = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                        e.len(),
-                        e
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
-                    return Ok(());
                 }
             }
+            return Ok(());
         }
     }
 
