@@ -19,6 +19,12 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=shell32");
     println!("cargo:rustc-link-lib=dylib=ole32");
 
+    // MSVC 链接器下补充 legacy stdio 符号（解决 Go cgo 生成的代码引用的 fprintf 等历史符号）
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("msvc") {
+        println!("cargo:rustc-link-lib=dylib=legacy_stdio_definitions");
+    }
+
     println!("cargo:rerun-if-changed=lib/librclone.a");
     println!("cargo:rerun-if-changed=../dist");
     println!("cargo:rerun-if-changed=tauri.conf.json");
