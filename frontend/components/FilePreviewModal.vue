@@ -37,8 +37,8 @@ const textContent = ref<string>('')
 const isCopied = ref(false)
 const isExpanded = ref(false)
 
-// 20 MB 预览体积熔断保护
-const MAX_PREVIEW_SIZE = 20 * 1024 * 1024
+// 200 MB 预览体积熔断保护（放宽至 200MB，支持绝大多数常见音频/视频/文档）
+const MAX_PREVIEW_SIZE = 200 * 1024 * 1024
 
 const ext = computed(() => {
   if (!props.item || props.item.IsDir) return ''
@@ -107,16 +107,8 @@ async function loadPreview() {
   cleanBlob()
   if (!props.item || props.item.IsDir) return
 
-  // 1. 视频与音频：直接走 HTTP Range 流式分块解密通道，支持 1GB+ 无内存压力秒开与拖拽
-  if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
-    const encoded = encodeURIComponent(props.item.Path)
-    blobUrl.value = `http://stream.localhost/${encoded}`
-    return
-  }
-
-  // 2. 文本、图片、PDF：走内存快速加载（带 30MB 保护）
   if (props.item.Size > MAX_PREVIEW_SIZE) {
-    errorMsg.value = `该文件体积为 ${(props.item.Size / 1024 / 1024).toFixed(1)} MB，超出文档/图片快速预览上限（20 MB）。建议直接导出后查看。`
+    errorMsg.value = `该文件体积为 ${(props.item.Size / 1024 / 1024).toFixed(1)} MB，超出内存安全预览上限（200 MB）。为保障流畅性，请直接导出后查看。`
     return
   }
 

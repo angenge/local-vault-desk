@@ -355,219 +355,22 @@ async fn read_file_preview(
     vault_item_path: String,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, String> {
-    let limit = max_bytes.unwrap_or(20 * 1024 * 1024); // 默认限制 20MB
+    let limit = max_bytes.unwrap_or(200 * 1024 * 1024); // 放宽至 200MB，支持绝大部分常见音频/视频/文档
     let service = state.inner().clone();
     tokio::task::spawn_blocking(move || service.read_file_preview(&vault_item_path, limit))
         .await
         .map_err(|e| format!("预览任务异常: {}", e))?
 }
 
-fn handle_media_stream(
-    vs: Arc<VaultService>,
-    request: tauri::http::Request<Vec<u8>>,
-    responder: tauri::UriSchemeResponder,
-) {
-    // URI 格式: stream://localhost/<url_encoded_path>
-    let uri_path = request.uri().path().trim_start_matches('/');
-    let raw_path = match percent_encoding_decode(uri_path) {
-        Ok(p) => p,
-        Err(_) => {
-            responder.respond(
-                tauri::http::Response::builder()
-                    .status(tauri::http::StatusCode::BAD_REQUEST)
-                    .body("Invalid URI Path".as_bytes().to_vec())
-                    .unwrap(),
-            );
-            return;
-        }
-    };
-
-    let item_stat = match vs.stat_item(&raw_path) {
-        Ok(s) => s,
-        Err(e) => {
-            responder.respond(
-                tauri::http::Response::builder()
-                    .status(tauri::http::StatusCode::NOT_FOUND)
-                    .body(e.into_bytes())
-                    .unwrap(),
-            );
-            return;
-        }
-    };
-
-    let total_size = item_stat.size.max(0) as u64;
-    let mime_type = match get_mime_by_filename(&item_stat.name) {
-        Some(m) => m,
-        None => "application/octet-stream",
-    };
-
-    // 解析 HTTP Range 头 (例如: bytes=0- 或 bytes=1048576-2097151)
-    let range_header = request
-        .headers()
-        .get(tauri::http::header::RANGE)
-        .and_then(|h| h.to_str().ok());
-
-    // 确定切片范围
-    let (start, end) = if let Some(range_str) = range_header {
-        parse_range(range_str, total_size).unwrap_or((0, total_size.saturating_sub(1)))
-    } else {
-        (0, total_size.saturating_sub(1))
-    };
-
-    if total_size == 0 || start >= total_size {
-        responder.respond(
-            tauri::http::Response::builder()
-                .status(if range_header.is_some() {
-                    tauri::http::StatusCode::RANGE_NOT_SATISFIABLE
-                } else {
-                    tauri::http::StatusCode::OK
-                })
-                .header(tauri::http::header::CONTENT_TYPE, mime_type)
-                .header(tauri::http::header::CONTENT_LENGTH, "0")
-                .header(tauri::http::header::ACCEPT_RANGES, "bytes")
-                .body(Vec::new())
-                .unwrap(),
-        );
-        return;
-    }
-
-    let chunk_length = (end - start + 1).min(total_size - start);
-
-    // 通过只读私有临时缓存流式读取指定字节范围（无需将 1GB 视频全部加载进内存）
-    match read_file_range_stream(&vs, &raw_path, start, chunk_length) {
-        Ok(chunk_data) => {
-            let mut builder = tauri::http::Response::builder()
-                .header(tauri::http::header::CONTENT_TYPE, mime_type)
-                .header(tauri::http::header::ACCEPT_RANGES, "bytes")
-                .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(
-                    tauri::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Range, Content-Range, Content-Type",
-                );
-
-            if range_header.is_some() {
-                let actual_end = start + chunk_data.len() as u64 - 1;
-                builder = builder
-                    .status(tauri::http::StatusCode::PARTIAL_CONTENT)
-                    .header(
-                        tauri::http::header::CONTENT_RANGE,
-                        format!("bytes {}-{}/{}", start, actual_end, total_size),
-                    )
-                    .header(tauri::http::header::CONTENT_LENGTH, chunk_data.len().to_string());
-            } else {
-                builder = builder
-                    .status(tauri::http::StatusCode::OK)
-                    .header(tauri::http::header::CONTENT_LENGTH, total_size.to_string());
-            }
-
-            responder.respond(builder.body(chunk_data).unwrap());
-        }
-        Err(e) => {
-            responder.respond(
-                tauri::http::Response::builder()
-                    .status(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(format!("流读取失败: {}", e).into_bytes())
-                    .unwrap(),
-            );
-        }
-    }
-}
-
-fn percent_encoding_decode(s: &str) -> Result<String, ()> {
-    let mut bytes = Vec::new();
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let h1 = chars.next().ok_or(())?;
-            let h2 = chars.next().ok_or(())?;
-            let hex_buf = [h1, h2];
-            let hex_str = std::str::from_utf8(&hex_buf).map_err(|_| ())?;
-            let val = u8::from_str_radix(hex_str, 16).map_err(|_| ())?;
-            bytes.push(val);
-        } else {
-            bytes.push(b);
-        }
-    }
-    String::from_utf8(bytes).map_err(|_| ())
-}
-
-fn parse_range(range_header: &str, total: u64) -> Option<(u64, u64)> {
-    let stripped = range_header.trim().strip_prefix("bytes=")?;
-    let parts: Vec<&str> = stripped.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let start_str = parts[0].trim();
-    let end_str = parts[1].trim();
-
-    if start_str.is_empty() {
-        // -500: 最后 500 字节
-        let len: u64 = end_str.parse().ok()?;
-        let start = total.saturating_sub(len);
-        Some((start, total.saturating_sub(1)))
-    } else {
-        let start: u64 = start_str.parse().ok()?;
-        if end_str.is_empty() {
-            // 500-: 从 500 到文件结尾 (流式分块最多提供 4MB 避免单次内存消耗)
-            let end = (start + 4 * 1024 * 1024).min(total.saturating_sub(1));
-            Some((start, end))
-        } else {
-            let end: u64 = end_str.parse().ok()?;
-            Some((start, end.min(total.saturating_sub(1))))
-        }
-    }
-}
-
-fn get_mime_by_filename(name: &str) -> Option<&'static str> {
-    let lower = name.to_lowercase();
-    let ext = lower.rsplit('.').next()?;
-    match ext {
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "mkv" => Some("video/x-matroska"),
-        "mov" => Some("video/quicktime"),
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "ogg" => Some("audio/ogg"),
-        "flac" => Some("audio/flac"),
-        "aac" => Some("audio/aac"),
-        "m4a" => Some("audio/mp4"),
-        "pdf" => Some("application/pdf"),
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
-/// 针对大文件在内存中安全流式解密指定范围（利用 Range 分块，单次仅读取几兆字节）
-fn read_file_range_stream(
-    vs: &VaultService,
-    remote_path: &str,
-    start: u64,
-    length: u64,
-) -> Result<Vec<u8>, String> {
-    let clean_path = remote_path.trim_start_matches('/');
-    vs.read_file_stream_range(clean_path, start, length)
-}
-
 pub fn run() {
     let vault_service = Arc::new(VaultService::new());
     let vs_clone = vault_service.clone();
     let vs_setup = vault_service.clone();
-    let vs_stream = vault_service.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(vault_service)
-        .register_asynchronous_uri_scheme_protocol("stream", move |_app, request, responder| {
-            let vs = vs_stream.clone();
-            tokio::task::spawn_blocking(move || {
-                handle_media_stream(vs, request, responder);
-            });
-        })
         .setup(move |app| {
             vs_setup.set_app_handle(app.handle().clone());
             Ok(())
