@@ -859,6 +859,71 @@ fn run_bugfix_regression_test() {
     service.restart_stream_server_with_lan(true).expect("切换为0.0.0.0局域网监听");
     let lan_status = service.get_stream_server_status();
     assert_eq!(lan_status.get("is_lan").and_then(|v| v.as_bool()), Some(true), "局域网状态应标记为true");
+
+    // 8.2 端到端 HTTP 级回归：无 Range 请求必须回 200（此前误回 416 导致浏览器打不开视频）
+    println!("  - 执行端到端 HTTP 协议级验证（200 / 206 / HEAD）...");
+    // 重启后端口已变，必须重新获取 URL（含新端口和新 Token）
+    let fresh_url = service.get_stream_url("sub_work/normal_audit.txt", false).expect("重启后获取流媒体URL");
+    {
+        use std::io::{Read, Write};
+        let without = fresh_url.trim_start_matches("http://");
+        let idx = without.find('/').unwrap();
+        let host = &without[..idx];
+        let path = &without[idx..];
+
+        // 1. 无 Range 请求 → 200 + 完整正文
+        {
+            let mut s = std::net::TcpStream::connect(host).expect("连接流媒体服务");
+            let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            let first = buf.lines().next().unwrap_or("");
+            assert!(first.starts_with("HTTP/1.1 200"), "无 Range GET 必须回 200，实际: {}", first);
+            assert!(buf.contains("some text"), "正文必须含解密明文");
+        }
+
+        // 2. HEAD → 200 空正文
+        {
+            let mut s = std::net::TcpStream::connect(host).expect("连接流媒体服务");
+            let req = format!("HEAD {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            let first = buf.lines().next().unwrap_or("");
+            assert!(first.starts_with("HTTP/1.1 200"), "HEAD 必须回 200，实际: {}", first);
+            // HEAD 不应有正文（仅 headers + 空行）
+            let split = buf.find("\r\n\r\n").unwrap_or(buf.len());
+            assert!(buf[split + 4..].is_empty(), "HEAD 不应有正文");
+        }
+
+        // 3. Range bytes=0-3 → 206
+        {
+            let mut s = std::net::TcpStream::connect(host).expect("连接流媒体服务");
+            let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-3\r\nConnection: close\r\n\r\n", path, host);
+            s.write_all(req.as_bytes()).unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).unwrap();
+            let text = String::from_utf8_lossy(&raw);
+            let first = text.lines().next().unwrap_or("");
+            assert!(first.starts_with("HTTP/1.1 206"), "合法 Range 必须回 206，实际: {}", first);
+            let split = text.find("\r\n\r\n").unwrap();
+            assert_eq!(&raw[split + 4..], b"some", "Range 0-3 应返回前 4 字节");
+        }
+
+        // 4. 越界 Range → 416
+        {
+            let mut s = std::net::TcpStream::connect(host).expect("连接流媒体服务");
+            let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=9999999999-\r\nConnection: close\r\n\r\n", path, host);
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            assert!(buf.starts_with("HTTP/1.1 416"), "越界 Range 必须回 416，实际首行: {}", buf.lines().next().unwrap_or(""));
+        }
+
+        println!("  -> 端到端 HTTP 协议级验证通过：200 / 206 / HEAD / 416 均符合预期");
+    }
+
     println!("-> 验证通过：本地流媒体微服务与 0.0.0.0 局域网模式切换验证成功！");
 
     service.lock_vault();
