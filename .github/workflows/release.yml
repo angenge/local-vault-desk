@@ -89,5 +89,4 @@ jobs:
             dist-portable/*.zip
             src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*.exe
             src-tauri/target/x86_64-pc-windows-gnu/release/bundle/msi/*.msi
-            src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe
           generate_release_notes: true
