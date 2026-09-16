@@ -843,8 +843,12 @@ fn run_bugfix_regression_test() {
     println!("\n7. 验证内存流式预览接口与体积熔断...");
     let preview_bytes = service.read_file_preview("sub_work/normal_audit.txt", 1024 * 1024).expect("预览应成功");
     assert_eq!(preview_bytes, b"some text", "预览数据应完全一致");
-    let oom_err = service.read_file_preview("sub_work/normal_audit.txt", 4);
-    assert!(oom_err.is_err(), "超限体积必须被拦截拒绝");
+    // 小上限语义 = 截断读取到上限字节数（非报错），供前端小窗口预览使用
+    let truncated = service.read_file_preview("sub_work/normal_audit.txt", 4).expect("截断读取应成功");
+    assert_eq!(truncated, b"some", "预览应截断至所请求上限字节");
+    // 超过体积熔断上限（200MB）必须被拒绝，防止误读超大文件拖垮内存
+    let oom_err = service.read_file_preview("sub_work/normal_audit.txt", 300 * 1024 * 1024);
+    assert!(oom_err.is_err(), "超过熔断上限必须被拦截拒绝");
     println!("-> 验证通过：内存流式安全预览与熔断限制机制工作正常！");
 
     // 8. 验证本地安全流媒体服务及 0.0.0.0 局域网动态切换
