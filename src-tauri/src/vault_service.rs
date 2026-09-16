@@ -720,7 +720,46 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         if is_internal_control(vault_item_path) {
             return Err("内部管控文件不可预览".into());
         }
-        self.rclone.read_file_bytes(vault_item_path, max_bytes)
+        self.rclone.read_file_range_bytes(vault_item_path, 0, max_bytes as u64)
+    }
+
+    /// 分块流式读取（用于视频、音频 Range 头分片播放）
+    pub fn read_file_stream_range(&self, vault_item_path: &str, start: u64, length: u64) -> Result<Vec<u8>, String> {
+        let is_unlocked = self.status.lock().unwrap().is_unlocked;
+        if !is_unlocked {
+            return Err("保险箱尚未解锁".into());
+        }
+        if is_internal_control(vault_item_path) {
+            return Err("内部管控文件不可预览".into());
+        }
+        self.rclone.read_file_range_bytes(vault_item_path, start, length)
+    }
+
+    /// 检查并获取指定文件的元信息（大小、MIME 等）
+    pub fn stat_item(&self, remote_path: &str) -> Result<RcloneItem, String> {
+        let is_unlocked = self.status.lock().unwrap().is_unlocked;
+        if !is_unlocked {
+            return Err("保险箱尚未解锁".into());
+        }
+        let clean = remote_path.trim_start_matches('/').to_string();
+        let parent = match clean.rfind('/') {
+            Some(idx) => &clean[..idx],
+            None => "",
+        };
+        let items = self.rclone.list_files(parent)?;
+        let name = Path::new(&clean)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        items
+            .into_iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| format!("未找到文件: {}", remote_path))
+    }
+
+    /// 获取底层 Rclone 服务的只读引用（用于自定义协议流式处理）
+    pub fn rclone_ref(&self) -> &RcloneService {
+        &self.rclone
     }
 
     /// 取消当前正在进行的传输任务（导入/导出）

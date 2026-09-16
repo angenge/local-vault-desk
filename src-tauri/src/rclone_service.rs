@@ -546,15 +546,16 @@ impl RcloneService {
         read_res
     }
 
-    /// 读取文件二进制字节数据（用于安全预览，读取后立即销毁临时文件并限制最大体积）
-    pub fn read_file_bytes(&self, remote_path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    /// 读取文件指定范围的二进制字节数据（流式 Range 边播边解密，绝不全量加载 1GB 到内存）
+    pub fn read_file_range_bytes(&self, remote_path: &str, start: u64, length: u64) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Seek, SeekFrom};
         let clean_path = remote_path.trim_start_matches('/');
         let temp_dir = private_tmp_dir();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temp_file = temp_dir.join(format!("_vault_preview_{}_{}.tmp", std::process::id(), ts));
+        let temp_file = temp_dir.join(format!("_vault_stream_{}_{}.tmp", std::process::id(), ts));
 
         let dst_dir = temp_file
             .parent()
@@ -563,7 +564,7 @@ impl RcloneService {
         let dst_file = temp_file
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "_vault_preview.tmp".to_string());
+            .unwrap_or_else(|| "_vault_stream.tmp".to_string());
 
         let res = self.call_rc(
             "operations/copyfile",
@@ -577,15 +578,16 @@ impl RcloneService {
 
         let read_res = match res {
             Ok(_) => {
-                let meta = fs::metadata(&temp_file).map_err(|e| e.to_string())?;
-                if meta.len() as usize > max_bytes {
-                    Err(format!(
-                        "文件体积 ({} MB) 超出预览上限 ({} MB)，请直接使用导出功能查看",
-                        meta.len() / 1024 / 1024,
-                        max_bytes / 1024 / 1024
-                    ))
+                let mut file = fs::File::open(&temp_file).map_err(|e| e.to_string())?;
+                let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+                if start >= file_len {
+                    Ok(Vec::new())
                 } else {
-                    fs::read(&temp_file).map_err(|e| e.to_string())
+                    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+                    let to_read = length.min(file_len - start) as usize;
+                    let mut buffer = vec![0u8; to_read];
+                    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+                    Ok(buffer)
                 }
             }
             Err(e) => Err(e),
