@@ -1,10 +1,11 @@
 use crate::audit;
 use crate::crypto::derive_keys;
 use crate::rclone_service::{EngineStatus, RcloneItem, RcloneService, SearchHit, TransferProgress};
+use crate::stream_server::MediaStreamServer;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const AUTH_FILE_NAME: &str = ".vault_auth";
 const AUTH_FILE_CONTENT: &str = "SAFE_VAULT_AUTHORIZED_2026";
@@ -81,22 +82,25 @@ pub struct VaultDirInspection {
 }
 
 pub struct VaultService {
-    rclone: RcloneService,
+    rclone: Arc<RcloneService>,
     status: Mutex<VaultStatus>,
     // 派生后的 rclone crypt 密钥材料（key_hex, salt_hex），仅驻留内存，锁定即清除
     crypt_keys: Mutex<Option<(String, String)>>,
+    // 本地流媒体微服务句柄（仅在解锁状态下运行，锁定即物理销毁）
+    stream_server: Mutex<Option<MediaStreamServer>>,
 }
 
 impl VaultService {
     pub fn new() -> Self {
         Self {
-            rclone: RcloneService::new(),
+            rclone: Arc::new(RcloneService::new()),
             status: Mutex::new(VaultStatus {
                 is_unlocked: false,
                 vault_path: String::new(),
                 username: String::new(),
             }),
             crypt_keys: Mutex::new(None),
+            stream_server: Mutex::new(None),
         }
     }
 
@@ -269,6 +273,9 @@ impl VaultService {
         }
 
         *self.crypt_keys.lock().unwrap() = Some((key, salt));
+        // 启动本地流媒体微服务（127.0.0.1 随机端口 + Token 鉴权）
+        self.restart_stream_server();
+
         let mut st = self.status.lock().unwrap();
         st.is_unlocked = true;
         st.vault_path = vault_path.to_string();
@@ -296,6 +303,9 @@ impl VaultService {
         match self.rclone.read_text_file(AUTH_FILE_NAME) {
             Ok(content) if content.trim() == AUTH_FILE_CONTENT => {
                 *self.crypt_keys.lock().unwrap() = Some((key, salt));
+                // 启动本地流媒体微服务
+                self.restart_stream_server();
+
                 let mut st = self.status.lock().unwrap();
                 st.is_unlocked = true;
                 st.vault_path = vault_path.to_string();
@@ -310,6 +320,7 @@ impl VaultService {
                 // 失败审计仅驻留内存（锁定后 get_audit_log 返回空），绝不写盘明文日志，
                 // 避免用户账号名等信息以明文残留磁盘。
                 *self.crypt_keys.lock().unwrap() = None;
+                self.stop_stream_server();
                 self.rclone.unmount_vault();
                 Err("账号或主密码错误，无法解密该保险箱！".into())
             }
@@ -319,6 +330,7 @@ impl VaultService {
     pub fn lock_vault(&self) -> VaultStatus {
         self.audit("lock", "锁定保险箱");
         *self.crypt_keys.lock().unwrap() = None;
+        self.stop_stream_server();
         self.rclone.unmount_vault();
         let mut st = self.status.lock().unwrap();
         st.is_unlocked = false;
@@ -762,12 +774,44 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         &self.rclone
     }
 
+    /// 重启/启动本地流媒体微服务
+    fn restart_stream_server(&self) {
+        self.stop_stream_server();
+        let rclone_clone = self.rclone.clone();
+        if let Ok(server) = MediaStreamServer::start(move |path, start, len| {
+            rclone_clone.read_file_range_bytes(path, start, len)
+        }) {
+            *self.stream_server.lock().unwrap() = Some(server);
+        }
+    }
+
+    /// 停止并销毁本地流媒体微服务
+    fn stop_stream_server(&self) {
+        if let Some(server) = self.stream_server.lock().unwrap().take() {
+            server.stop();
+        }
+    }
+
+    /// 获取文件的本地安全流媒体 URL（带 127.0.0.1 + Token 鉴权）
+    pub fn get_stream_url(&self, remote_path: &str) -> Result<String, String> {
+        let is_unlocked = self.status.lock().unwrap().is_unlocked;
+        if !is_unlocked {
+            return Err("保险箱尚未解锁".into());
+        }
+        let lock = self.stream_server.lock().unwrap();
+        match lock.as_ref() {
+            Some(srv) => Ok(srv.get_stream_url(remote_path)),
+            None => Err("流媒体服务未就绪".into()),
+        }
+    }
+
     /// 取消当前正在进行的传输任务（导入/导出）
     pub fn cancel_transfer(&self) -> Result<(), String> {
         self.rclone.cancel_transfer()
     }
 
     pub fn stop(&self) {
+        self.stop_stream_server();
         self.rclone.stop_daemon();
         crate::librclone::finalize();
     }

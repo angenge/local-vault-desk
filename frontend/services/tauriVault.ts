@@ -181,8 +181,12 @@ export const tauriVault = {
     return await invoke<InteropSelfVerify>('interop_self_verify')
   },
 
-  // ===== 内存安全文件预览 =====
+  // ===== 内存安全文件预览与本地流媒体 =====
   async readFilePreview(data: { vaultItemPath: string; maxBytes?: number }): Promise<number[]> {
     return await invoke<number[]>('read_file_preview', data)
+  },
+
+  async getStreamUrl(vaultItemPath: string): Promise<string> {
+    return await invoke<string>('get_stream_url', { vaultItemPath })
   }
 }

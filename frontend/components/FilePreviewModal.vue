@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted } from 'vue'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { tauriVault } from '@/services/tauriVault'
 import type { RcloneItem } from '@/types'
 import {
@@ -17,7 +18,9 @@ import {
   Maximize2,
   Minimize2,
   Copy,
-  Check
+  Check,
+  ExternalLink,
+  Tv
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -33,8 +36,10 @@ const emit = defineEmits<{
 const loading = ref(false)
 const errorMsg = ref('')
 const blobUrl = ref<string | null>(null)
+const streamUrl = ref<string | null>(null)
 const textContent = ref<string>('')
 const isCopied = ref(false)
+const isStreamCopied = ref(false)
 const isExpanded = ref(false)
 const mediaDecodeError = ref(false)
 const isAudioOnlyPlaying = ref(false)
@@ -113,9 +118,11 @@ function cleanBlob() {
     URL.revokeObjectURL(blobUrl.value)
     blobUrl.value = null
   }
+  streamUrl.value = null
   textContent.value = ''
   errorMsg.value = ''
   isCopied.value = false
+  isStreamCopied.value = false
   mediaDecodeError.value = false
   isAudioOnlyPlaying.value = false
 }
@@ -124,7 +131,19 @@ async function loadPreview() {
   cleanBlob()
   if (!props.item || props.item.IsDir) return
 
+  // 1. 如果是音视频媒体，获取本地 127.0.0.1 安全流式播放 URL（支持在浏览器或外部播放器中流畅硬解播放）
+  if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
+    try {
+      streamUrl.value = await tauriVault.getStreamUrl(props.item.Path)
+    } catch {}
+  }
+
+  // 2. 对于体积在 200MB 内的文件，加载内存 Blob 供弹窗内快速预览
   if (props.item.Size > MAX_PREVIEW_SIZE) {
+    if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
+      // 视频文件大体积可直接通过流媒体地址播放
+      return
+    }
     errorMsg.value = `该文件体积为 ${(props.item.Size / 1024 / 1024).toFixed(1)} MB，超出内存安全预览上限（200 MB）。为保障流畅性，请直接导出后查看。`
     return
   }
@@ -154,6 +173,24 @@ async function loadPreview() {
   } finally {
     loading.value = false
   }
+}
+
+async function openInBrowser() {
+  if (!streamUrl.value) return
+  try {
+    await openUrl(streamUrl.value)
+  } catch {}
+}
+
+async function copyStreamLink() {
+  if (!streamUrl.value) return
+  try {
+    await navigator.clipboard.writeText(streamUrl.value)
+    isStreamCopied.value = true
+    setTimeout(() => {
+      isStreamCopied.value = false
+    }, 2000)
+  } catch {}
 }
 
 watch(
@@ -222,6 +259,28 @@ async function copyText() {
         </div>
 
         <div class="flex items-center gap-1.5 shrink-0">
+          <!-- 外部播放器 / 浏览器串流按钮 -->
+          <template v-if="(fileCategory === 'video' || fileCategory === 'audio') && streamUrl">
+            <button
+              type="button"
+              @click="openInBrowser"
+              class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium transition flex items-center gap-1.5 border border-slate-700"
+              title="在系统默认浏览器中打开全屏硬解播放"
+            >
+              <ExternalLink class="w-3.5 h-3.5 text-blue-400" />
+              <span class="hidden md:inline">浏览器播放</span>
+            </button>
+            <button
+              type="button"
+              @click="copyStreamLink"
+              class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition"
+              :title="isStreamCopied ? '已复制播放地址' : '复制流媒体直链 (可在 PotPlayer/VLC 中直接打开)'"
+            >
+              <Check v-if="isStreamCopied" class="w-4 h-4 text-emerald-400" />
+              <Tv v-else class="w-4 h-4 text-cyan-400" />
+            </button>
+          </template>
+
           <button
             v-if="fileCategory === 'text' && textContent"
             type="button"
@@ -332,17 +391,29 @@ async function copyText() {
           <!-- 若检测到音频轨道正常但无画面/视频尺寸为0（典型的 H.265 纯音频播放现象） -->
           <div v-if="mediaDecodeError || isAudioOnlyPlaying" class="absolute inset-0 bg-slate-900/95 flex flex-col items-center justify-center p-6 text-center space-y-3 rounded-xl m-2">
             <AlertCircle class="w-10 h-10 text-amber-400" />
-            <h4 class="text-sm font-semibold text-white">检测到该 MP4 采用特殊视频编码 (如 H.265 / HEVC)</h4>
+            <h4 class="text-sm font-semibold text-white">当前内置播放器无法解码该视频画面 (如 H.265 / HEVC)</h4>
             <p class="text-xs text-slate-400 max-w-md leading-relaxed">
-              当前 Windows 内置的 WebView2 播放器缺少该视频轨的硬件解码器，因此退化为仅播放声音。建议将其解密导出后，使用本地播放器（如 PotPlayer / 恒星播放器 / VLC）即可正常观看完整画面。
+              因 Windows WebView2 组件缺少部分视频编码的硬件解码器，无法直接渲染画面。您可以通过本地安全流媒体在外部专业播放器或浏览器中直接观看，无需等待导出。
             </p>
-            <div class="flex items-center gap-3 pt-2">
+            <div class="flex flex-wrap items-center justify-center gap-2.5 pt-2">
               <button
+                v-if="streamUrl"
                 type="button"
-                @click="isAudioOnlyPlaying = false"
-                class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition"
+                @click="openInBrowser"
+                class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl transition shadow flex items-center gap-1.5"
               >
-                继续仅听音频
+                <ExternalLink class="w-3.5 h-3.5" />
+                在默认浏览器中打开
+              </button>
+              <button
+                v-if="streamUrl"
+                type="button"
+                @click="copyStreamLink"
+                class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition border border-slate-700 flex items-center gap-1.5"
+              >
+                <Check v-if="isStreamCopied" class="w-3.5 h-3.5 text-emerald-400" />
+                <Tv v-else class="w-3.5 h-3.5 text-cyan-400" />
+                <span>{{ isStreamCopied ? '已复制直链' : '复制串流地址 (PotPlayer/VLC)' }}</span>
               </button>
               <button
                 type="button"
@@ -350,7 +421,7 @@ async function copyText() {
                 class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl transition shadow flex items-center gap-1.5"
               >
                 <Download class="w-3.5 h-3.5" />
-                解密并导出到本地播放
+                解密导出到本地
               </button>
             </div>
           </div>

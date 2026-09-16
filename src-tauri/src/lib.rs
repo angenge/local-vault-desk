@@ -2,6 +2,7 @@ pub mod audit;
 pub mod crypto;
 pub mod librclone;
 pub mod rclone_service;
+pub mod stream_server;
 pub mod vault_service;
 
 use rclone_service::{EngineStatus, RcloneItem, SearchHit, TransferProgress};
@@ -362,6 +363,17 @@ async fn read_file_preview(
         .map_err(|e| format!("预览任务异常: {}", e))?
 }
 
+#[tauri::command]
+async fn get_stream_url(
+    state: State<'_, SharedVault>,
+    vault_item_path: String,
+) -> Result<String, String> {
+    let service = state.inner().clone();
+    tokio::task::spawn_blocking(move || service.get_stream_url(&vault_item_path))
+        .await
+        .map_err(|e| format!("获取流媒体地址失败: {}", e))?
+}
+
 pub fn run() {
     let vault_service = Arc::new(VaultService::new());
     let vs_clone = vault_service.clone();
@@ -405,6 +417,7 @@ pub fn run() {
             get_audit_log,
             cancel_transfer,
             read_file_preview,
+            get_stream_url,
             get_interop_config,
             verify_interop,
             interop_self_verify
