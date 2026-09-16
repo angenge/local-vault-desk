@@ -391,42 +391,40 @@ where
         }
     }
 
-    // 无 Range（或 Range 无法解析）：小文件整体返回，大文件回 416 逼播放器改用 Range 切片
-    if total > 0 && total <= 4 * 1024 * 1024u64 {
-        match read_fn(&file_path, 0, total) {
-            Ok((_, data, _)) => {
-                let resp_header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-                    mime_type,
-                    data.len()
-                );
-                let _ = stream.write_all(resp_header.as_bytes());
-                if method == "GET" {
-                    let _ = stream.write_all(&data);
+    // 无 Range（或 Range 无法解析）：以 200 OK + 完整 Content-Length 流式下发整个文件。
+    // 浏览器/播放器直接打开 URL 时首请求不带 Range 头，此时回 416 会被浏览器判为页面错误。
+    if total > 0 {
+        let resp_header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            mime_type, total
+        );
+        let _ = stream.write_all(resp_header.as_bytes());
+        if method == "GET" {
+            // 分块顺序下发，全程不把整份明文加载进内存
+            let mut offset = 0u64;
+            const CHUNK: u64 = 1024 * 1024;
+            while offset < total {
+                let want = CHUNK.min(total - offset);
+                match read_fn(&file_path, offset, want) {
+                    Ok((_, data, _)) => {
+                        if data.is_empty() {
+                            break;
+                        }
+                        if stream.write_all(&data).is_err() {
+                            break; // 对端提前断开（如浏览器停止加载）
+                        }
+                        offset += data.len() as u64;
+                    }
+                    Err(_) => break,
                 }
             }
-            Err(e) => {
-                let resp = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                    e.len(),
-                    e
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            }
         }
-    } else if total == 0 {
+    } else {
         let resp_header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
             mime_type
         );
         let _ = stream.write_all(resp_header.as_bytes());
-    } else {
-        // 大文件且未带 Range：回 416 并告知真实总长，播放器随即改用 Range 请求
-        let resp = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
-            total
-        );
-        let _ = stream.write_all(resp.as_bytes());
     }
 
     Ok(())
