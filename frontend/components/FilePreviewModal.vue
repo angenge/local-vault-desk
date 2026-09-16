@@ -37,10 +37,19 @@ const textContent = ref<string>('')
 const isCopied = ref(false)
 const isExpanded = ref(false)
 const mediaDecodeError = ref(false)
+const isAudioOnlyPlaying = ref(false)
 const videoRef = ref<HTMLVideoElement | null>(null)
 
 function handleMediaError() {
   mediaDecodeError.value = true
+}
+
+function handleVideoLoadedMetadata(e: Event) {
+  const v = e.target as HTMLVideoElement
+  // 若元数据解析完成后 videoWidth 为 0（说明该 MP4 仅包含音频轨道，或者视频轨为未识别编码导致无画面）
+  if (v && v.videoWidth === 0 && v.videoHeight === 0 && v.duration > 0) {
+    isAudioOnlyPlaying.value = true
+  }
 }
 
 // 200 MB 预览体积熔断保护（放宽至 200MB，支持绝大多数常见音频/视频/文档）
@@ -108,6 +117,7 @@ function cleanBlob() {
   errorMsg.value = ''
   isCopied.value = false
   mediaDecodeError.value = false
+  isAudioOnlyPlaying.value = false
 }
 
 async function loadPreview() {
@@ -308,29 +318,41 @@ async function copyText() {
         </div>
 
         <!-- 3. 视频预览 -->
-        <div v-else-if="fileCategory === 'video' && blobUrl" class="w-full h-full flex flex-col items-center justify-center relative">
+        <div v-else-if="fileCategory === 'video' && blobUrl" class="w-full h-full flex flex-col items-center justify-center relative p-2">
           <video
             ref="videoRef"
             :src="blobUrl"
             controls
             playsinline
-            preload="auto"
-            class="max-w-full max-h-full rounded-xl shadow-lg bg-black"
+            preload="metadata"
+            class="max-w-full max-h-[68vh] w-auto h-auto rounded-xl shadow-2xl bg-black border border-slate-800"
+            @loadedmetadata="handleVideoLoadedMetadata"
             @error="handleMediaError"
           ></video>
-          <div v-if="mediaDecodeError" class="absolute inset-0 bg-slate-900/90 flex flex-col items-center justify-center p-6 text-center space-y-3 rounded-xl">
+          <!-- 若检测到音频轨道正常但无画面/视频尺寸为0（典型的 H.265 纯音频播放现象） -->
+          <div v-if="mediaDecodeError || isAudioOnlyPlaying" class="absolute inset-0 bg-slate-900/95 flex flex-col items-center justify-center p-6 text-center space-y-3 rounded-xl m-2">
             <AlertCircle class="w-10 h-10 text-amber-400" />
-            <h4 class="text-sm font-semibold text-white">当前系统解码器不支持该视频编码</h4>
-            <p class="text-xs text-slate-400 max-w-sm leading-relaxed">
-              该视频可能使用了 HEVC/H.265 或特殊的封装格式，当前 WebView2 无法直接硬件解码。建议导出后使用本地播放器（如 PotPlayer / VLC）查看。
+            <h4 class="text-sm font-semibold text-white">检测到该 MP4 采用特殊视频编码 (如 H.265 / HEVC)</h4>
+            <p class="text-xs text-slate-400 max-w-md leading-relaxed">
+              当前 Windows 内置的 WebView2 播放器缺少该视频轨的硬件解码器，因此退化为仅播放声音。建议将其解密导出后，使用本地播放器（如 PotPlayer / 恒星播放器 / VLC）即可正常观看完整画面。
             </p>
-            <button
-              type="button"
-              @click="emit('export', item)"
-              class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl transition shadow"
-            >
-              解密并导出到本地播放
-            </button>
+            <div class="flex items-center gap-3 pt-2">
+              <button
+                type="button"
+                @click="isAudioOnlyPlaying = false"
+                class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition"
+              >
+                继续仅听音频
+              </button>
+              <button
+                type="button"
+                @click="emit('export', item)"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl transition shadow flex items-center gap-1.5"
+              >
+                <Download class="w-3.5 h-3.5" />
+                解密并导出到本地播放
+              </button>
+            </div>
           </div>
         </div>
 
