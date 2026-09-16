@@ -684,6 +684,16 @@ impl RcloneService {
         expected_total: Option<i64>,
         batch_info: Option<(usize, usize)>,
     ) -> Result<(), String> {
+        // 单任务守卫：同一时刻只允许一个传输任务在跑。
+        // 否则新任务会 stats-reset 清掉旧任务进度、覆盖 active_job/cancel_requested，
+        // 导致进度清零、取消停错任务。批量导入/导出是逐项串行调用本方法的，不受影响。
+        {
+            let guard = self.active_job.lock().unwrap();
+            if guard.is_some() {
+                return Err("已有传输任务正在进行，请等待其完成或取消后再开始新任务".into());
+            }
+        }
+
         let _ = self.call_rc("core/stats-reset", serde_json::json!({}));
 
         if let Some(obj) = params.as_object_mut() {
@@ -717,6 +727,9 @@ impl RcloneService {
             self.emit_progress(&prog);
         }
 
+// RPC 连续失败计数：引擎被拆除（锁定/退出/服务重启）时 job/status 将永续报错，
+        // 若只靠 if let Ok 吞错会导致轮询无限空转、前端任务永久 pending。
+        let mut consecutive_failures: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_millis(150));
 
@@ -817,31 +830,49 @@ impl RcloneService {
             }
 
             // 检查作业状态
-            if let Ok(status) = self.call_rc("job/status", serde_json::json!({ "jobid": job_id })) {
-                let finished = status.get("finished").and_then(|v| v.as_bool()).unwrap_or(false);
-                if finished {
-                    let success = status.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                    self.active_job.lock().unwrap().take();
-                    *self.cancel_requested.lock().unwrap() = false;
-                    let mut prog = self.progress.lock().unwrap();
-                    let is_last_in_batch = match batch_info {
-                        Some((idx, total)) => idx + 1 >= total,
-                        None => true,
-                    };
-                    if is_last_in_batch {
-                        prog.active = false;
-                        if let Some((_, total)) = batch_info {
-                            prog.percentage = 100;
-                            prog.transferred_files = total as i64;
+            match self.call_rc("job/status", serde_json::json!({ "jobid": job_id })) {
+                Ok(status) => {
+                    consecutive_failures = 0;
+                    let finished = status.get("finished").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if finished {
+                        let success = status.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                        self.active_job.lock().unwrap().take();
+                        *self.cancel_requested.lock().unwrap() = false;
+                        let mut prog = self.progress.lock().unwrap();
+                        let is_last_in_batch = match batch_info {
+                            Some((idx, total)) => idx + 1 >= total,
+                            None => true,
+                        };
+                        if is_last_in_batch {
+                            prog.active = false;
+                            if let Some((_, total)) = batch_info {
+                                prog.percentage = 100;
+                                prog.transferred_files = total as i64;
+                            }
                         }
+                        self.emit_progress(&prog);
+                        if !success {
+                            let err = status.get("error").and_then(|v| v.as_str()).unwrap_or("传输任务执行失败");
+                            return Err(err.to_string());
+                        }
+                        break;
                     }
-                    self.emit_progress(&prog);
-                    if !success {
-                        let err = status.get("error").and_then(|v| v.as_str()).unwrap_or("传输任务执行失败");
-                        return Err(err.to_string());
-                    }
-                    break;
                 }
+                Err(_) => consecutive_failures += 1,
+            }
+
+            // 引擎/通道不可用（锁定、退出或服务重启）：连续 20 次（约 3 秒）轮询无响应即放弃等待
+            if consecutive_failures >= 20 {
+                self.active_job.lock().unwrap().take();
+                *self.cancel_requested.lock().unwrap() = false;
+                let mut prog = self.progress.lock().unwrap();
+                prog.active = false;
+                self.emit_progress(&prog);
+                eprintln!(
+                    "[rclone_service] 传输任务轮询连续失败 {} 次，判定引擎不可用，中断等待",
+                    consecutive_failures
+                );
+                return Err("传输引擎不可用（可能已锁定或服务重启），任务已中断".into());
             }
         }
 
@@ -861,6 +892,29 @@ impl RcloneService {
             }
             None => Err("当前没有正在进行的传输任务".into()),
         }
+    }
+
+    /// 取消并等待当前传输任务轮询线程退出（最长约 8 秒）。
+    /// 供锁定/退出流程在 finalize Go 运行时前调用，确保不再有线程持有 RPC 资源，
+    /// 否则轮询线程在 finalize 后继续调用已终结的 Go 运行时属未定义行为。
+    pub fn request_cancel_and_wait(&self) {
+        {
+            let guard = self.active_job.lock().unwrap();
+            if guard.is_none() {
+                return;
+            }
+        }
+        // 置位后轮询线程下一次迭代必走「取消」分支：job/stop → take() → 退出
+        *self.cancel_requested.lock().unwrap() = true;
+        for _ in 0..80 {
+            if self.active_job.lock().unwrap().is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // 兜底超时：仅清掉任务标记防误报，保持 cancel_requested 为 true，
+        // 轮询线程仍在运行时也会在下一轮迭代自行退出（结束前不得 finalize）。
+        self.active_job.lock().unwrap().take();
     }
 
     /// 解析导入目标：按源路径类型计算目标明文路径并完成名称逐段校验。

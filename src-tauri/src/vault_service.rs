@@ -864,6 +864,9 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
 
     pub fn stop(&self) {
         self.stop_stream_server();
+        // 先取消并等待在跑的传输任务退出后再终结 rclone Go 运行时，
+        // 避免轮询线程在 finalize 后仍调用已终结的运行时（未定义行为/退出崩溃）。
+        self.rclone.request_cancel_and_wait();
         self.rclone.stop_daemon();
         crate::librclone::finalize();
     }
