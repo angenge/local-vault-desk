@@ -38,17 +38,24 @@ export const useVaultStore = defineStore('vault', () => {
     checkEngine()
   }
 
+  // 请求序号：丢弃过期响应。快速导航/重复刷新时，较慢的旧请求后到会把
+  // files 覆盖成上一个目录的内容（面包屑与列表错位）。
+  let filesSeq = 0
+
   async function refreshFiles() {
     if (!isUnlocked.value) return
+    const seq = ++filesSeq
     loading.value = true
     errorMsg.value = ''
     try {
       files.value = await tauriVault.listFiles(currentDir.value)
+      if (seq !== filesSeq) return // 已有更新的请求，本次结果已过期
       await checkEngine()
     } catch (err: any) {
+      if (seq !== filesSeq) return
       errorMsg.value = typeof err === 'string' ? err : err?.message || '加载文件失败'
     } finally {
-      loading.value = false
+      if (seq === filesSeq) loading.value = false
     }
   }
 
