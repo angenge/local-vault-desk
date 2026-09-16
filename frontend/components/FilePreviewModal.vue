@@ -140,8 +140,9 @@ async function loadPreview() {
   cleanBlob()
   if (!props.item || props.item.IsDir) return
 
-  // 1. 如果是音视频媒体，获取本地/局域网安全流式播放 URL
+  // 音视频：直接走流媒体 URL（streamUrl），不再同时加载 blob 避免双份内存开销
   if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
+    loading.value = true
     try {
       const status = await tauriVault.getStreamServerStatus()
       isLanEnabled.value = status.is_lan
@@ -150,14 +151,16 @@ async function loadPreview() {
       if (status.is_lan) {
         lanStreamUrl.value = await tauriVault.getStreamUrl(props.item.Path, true)
       }
-    } catch {}
+    } catch (err: any) {
+      errorMsg.value = typeof err === 'string' ? err : err?.message || '获取流媒体地址失败'
+    } finally {
+      loading.value = false
+    }
+    return
   }
 
-  // 2. 对于体积在 200MB 内的文件，加载内存 Blob 供弹窗内快速预览
+  // 非媒体文件体积超限：给出提示
   if (props.item.Size > MAX_PREVIEW_SIZE) {
-    if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
-      return
-    }
     errorMsg.value = `该文件体积为 ${(props.item.Size / 1024 / 1024).toFixed(1)} MB，超出内存安全预览上限（200 MB）。为保障流畅性，请直接导出后查看。`
     return
   }
@@ -166,6 +169,7 @@ async function loadPreview() {
     return
   }
 
+  // 文本/图片/PDF：内存 Blob 读取
   loading.value = true
   try {
     const rawBytes = await tauriVault.readFilePreview({
@@ -443,11 +447,16 @@ async function copyText() {
           />
         </div>
 
-        <!-- 3. 视频预览 -->
-        <div v-else-if="fileCategory === 'video' && blobUrl" class="w-full h-full flex flex-col items-center justify-center relative p-2">
+        <!-- 3. 视频预览（优先 streamUrl 流式播放，无需全量加载到内存） -->
+        <div v-else-if="fileCategory === 'video' && streamUrl" class="w-full h-full flex flex-col items-center justify-center relative p-2">
+          <!-- 视频加载中：正在获取流媒体地址 / 等待首帧就绪 -->
+          <div v-if="loading" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-slate-950/95 rounded-xl text-slate-400">
+            <Loader2 class="w-8 h-8 animate-spin text-blue-500" />
+            <span class="text-xs tracking-wide">正在连接流媒体服务...</span>
+          </div>
           <video
             ref="videoRef"
-            :src="blobUrl"
+            :src="streamUrl"
             controls
             playsinline
             preload="metadata"
@@ -504,16 +513,23 @@ async function copyText() {
           </div>
         </div>
 
-        <!-- 4. 音频预览 -->
-        <div v-else-if="fileCategory === 'audio' && blobUrl" class="flex flex-col items-center justify-center gap-6 p-8 bg-slate-900/80 border border-slate-800 rounded-2xl">
-          <div class="w-20 h-20 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 flex items-center justify-center animate-pulse">
-            <Music class="w-10 h-10" />
+        <!-- 4. 音频预览（优先 streamUrl 流式播放） -->
+        <div v-else-if="fileCategory === 'audio' && streamUrl" class="flex flex-col items-center justify-center gap-6 p-8 bg-slate-900/80 border border-slate-800 rounded-2xl">
+          <!-- 音频加载中 -->
+          <div v-if="loading" class="flex flex-col items-center gap-3 text-slate-400">
+            <Loader2 class="w-8 h-8 animate-spin text-blue-500" />
+            <span class="text-xs tracking-wide">正在连接流媒体服务...</span>
           </div>
-          <div class="text-center">
-            <h4 class="text-sm font-semibold text-white">{{ item.Name }}</h4>
-            <p class="text-xs text-slate-400 mt-1">{{ formatSize(item.Size) }}</p>
-          </div>
-          <audio :src="blobUrl" controls preload="auto" class="w-72 sm:w-96" @error="handleMediaError"></audio>
+          <template v-else>
+            <div class="w-20 h-20 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 flex items-center justify-center animate-pulse">
+              <Music class="w-10 h-10" />
+            </div>
+            <div class="text-center">
+              <h4 class="text-sm font-semibold text-white">{{ item.Name }}</h4>
+              <p class="text-xs text-slate-400 mt-1">{{ formatSize(item.Size) }}</p>
+            </div>
+            <audio :src="streamUrl" controls preload="auto" class="w-72 sm:w-96" @error="handleMediaError"></audio>
+          </template>
           <p v-if="mediaDecodeError" class="text-xs text-amber-400">当前系统音频格式解码失败，建议导出后播放</p>
         </div>
 
