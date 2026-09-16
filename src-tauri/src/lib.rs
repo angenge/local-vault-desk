@@ -209,13 +209,18 @@ fn show_item_in_folder(full_path: String) -> bool {
     #[cfg(target_os = "windows")]
     {
         let win_path = full_path.replace('/', "\\");
-        let path_obj = std::path::Path::new(&win_path);
-        if !path_obj.exists() {
-            return false;
+        let mut path_obj = std::path::PathBuf::from(&win_path);
+        // 本地导入的源文件：exists() 通过后直接高亮；
+        // 保险箱虚拟路径（本机磁盘上不存在明文）：逐级向上回退到最近存在的目录再打开，
+        // 保证"定位"按钮永远有实际反馈，杜绝恒返回 false。
+        while !path_obj.exists() {
+            if !path_obj.pop() {
+                return false;
+            }
         }
         // /select, 必须与路径紧邻为单一参数，拆分为两段会导致 explorer 忽略 /select, 而仅打开默认目录
         let _ = Command::new("explorer.exe")
-            .arg(format!("/select,{}", win_path))
+            .arg(format!("/select,{}", path_obj.to_string_lossy()))
             .spawn();
         true
     }
