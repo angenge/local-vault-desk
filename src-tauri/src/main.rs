@@ -847,6 +847,16 @@ fn run_bugfix_regression_test() {
     assert!(oom_err.is_err(), "超限体积必须被拦截拒绝");
     println!("-> 验证通过：内存流式安全预览与熔断限制机制工作正常！");
 
+    // 8. 验证本地安全流媒体服务及 0.0.0.0 局域网动态切换
+    println!("\n8. 验证本地流媒体服务与 0.0.0.0 局域网动态模式切换...");
+    let local_url = service.get_stream_url("sub_work/normal_audit.txt", false).expect("获取本地流媒体URL");
+    assert!(local_url.contains("127.0.0.1"), "默认必须仅监听本地回环");
+    assert!(local_url.contains("token="), "必须携带安全会话Token");
+    service.restart_stream_server_with_lan(true).expect("切换为0.0.0.0局域网监听");
+    let lan_status = service.get_stream_server_status();
+    assert_eq!(lan_status.get("is_lan").and_then(|v| v.as_bool()), Some(true), "局域网状态应标记为true");
+    println!("-> 验证通过：本地流媒体微服务与 0.0.0.0 局域网模式切换验证成功！");
+
     service.lock_vault();
     service.stop();
     let _ = fs::remove_dir_all(&base_dir);

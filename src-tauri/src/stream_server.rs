@@ -1,26 +1,33 @@
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-/// 本地安全流媒体微服务，仅绑定 127.0.0.1 随机空闲高位端口，
+/// 本地/局域网安全流媒体微服务，
+/// 支持绑定 127.0.0.1 (纯本机) 或 0.0.0.0 (局域网共享)，
 /// 结合 32 字节随机会话 Token 鉴权，支持全套 HTTP 1.1 Range 分块，
 /// 锁定/退出时物理停机销毁。
 pub struct MediaStreamServer {
+    bind_ip: IpAddr,
     port: u16,
     token: String,
     running: Arc<AtomicBool>,
 }
 
 impl MediaStreamServer {
-    pub fn start<F>(read_range_fn: F) -> Result<Self, String>
+    pub fn start<F>(allow_lan: bool, read_range_fn: F) -> Result<Self, String>
     where
         F: Fn(&str, u64, u64) -> Result<Vec<u8>, String> + Send + Sync + 'static,
     {
-        // 绑定 127.0.0.1 纯本地回环，端口 0 由系统动态分配空闲高位端口
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("绑定本地流媒体端口失败: {}", e))?;
+        let bind_ip: IpAddr = if allow_lan {
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
+        } else {
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+        };
+
+        let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))
+            .map_err(|e| format!("绑定流媒体端口失败: {}", e))?;
         let addr = listener
             .local_addr()
             .map_err(|e| format!("获取本地端口失败: {}", e))?;
@@ -34,7 +41,6 @@ impl MediaStreamServer {
         let token_clone = token.clone();
         let read_fn = Arc::new(read_range_fn);
 
-        // 设置非阻塞/超时，以便能及时响应停机信号
         listener
             .set_nonblocking(false)
             .map_err(|e| e.to_string())?;
@@ -62,6 +68,7 @@ impl MediaStreamServer {
         });
 
         Ok(Self {
+            bind_ip,
             port,
             token,
             running,
@@ -72,10 +79,15 @@ impl MediaStreamServer {
         self.port
     }
 
+    pub fn is_lan_enabled(&self) -> bool {
+        self.bind_ip.is_unspecified()
+    }
+
     pub fn token(&self) -> &str {
         &self.token
     }
 
+    /// 获取本机 Loopback 直链
     pub fn get_stream_url(&self, remote_path: &str) -> String {
         let clean = remote_path.trim_start_matches('/');
         let encoded: String = percent_encode_path(clean);
@@ -85,9 +97,19 @@ impl MediaStreamServer {
         )
     }
 
+    /// 获取局域网 IP 直链（供手机/iPad 等设备在同 WiFi 下访问）
+    pub fn get_lan_stream_url(&self, remote_path: &str) -> String {
+        let clean = remote_path.trim_start_matches('/');
+        let encoded: String = percent_encode_path(clean);
+        let host_ip = get_local_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+        format!(
+            "http://{}:{}/stream/{}?token={}",
+            host_ip, self.port, encoded, self.token
+        )
+    }
+
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        // 主动连接自身以解除 listener.incoming() 的阻塞
         let _ = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], self.port)));
     }
 }
@@ -96,6 +118,15 @@ impl Drop for MediaStreamServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// 自动探测当前机器连接活跃局域网网络的实际 IPv4 地址（如 192.168.x.x）
+pub fn get_local_lan_ip() -> Option<String> {
+    // 建立一个伪 UDP socket（不实际发送数据包）以让操作系统路由表选择默认的出口网卡 IP
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
 }
 
 fn generate_random_token() -> String {
@@ -110,7 +141,6 @@ fn generate_random_token() -> String {
             .to_ne_bytes(),
     );
     let extra = [0u8; 16];
-    // 简易伪随机扰动
     let ptr = &extra as *const _ as usize;
     h.update(ptr.to_ne_bytes());
     hex::encode(h.finalize())
@@ -183,13 +213,12 @@ where
         return Ok(());
     }
 
-    // 解析 URI 与 query
     let (url_path, query_str) = match full_path.find('?') {
         Some(idx) => (&full_path[..idx], &full_path[idx + 1..]),
         None => (full_path, ""),
     };
 
-    // 校验 Token 鉴权
+    // 强 Token 鉴权：局域网/本机请求均必须携带匹配的 32 字节会话 Token
     let token_ok = query_str
         .split('&')
         .any(|p| p.starts_with("token=") && &p[6..] == valid_token);
@@ -216,7 +245,6 @@ where
         }
     };
 
-    // 解析 HTTP Range 头
     let mut range_header: Option<&str> = None;
     for line in lines {
         if line.to_lowercase().starts_with("range:") {
@@ -226,13 +254,9 @@ where
     }
 
     let mime_type = get_mime_by_filename(&file_path);
-
-    // 探测文件总大小（通过首部分片或者读取函数）
-    // 默认单片窗口 2MB
     let default_chunk_size = 2 * 1024 * 1024u64;
 
     if let Some(range_str) = range_header {
-        // 请求分片
         if let Some((start, end_opt)) = parse_http_range(range_str) {
             let chunk_len = match end_opt {
                 Some(end) => (end - start + 1).min(default_chunk_size),
@@ -267,7 +291,6 @@ where
         }
     }
 
-    // 无 Range 头全量请求（返回前 4MB 启动帧）
     match read_fn(&file_path, 0, 4 * 1024 * 1024) {
         Ok(data) => {
             let resp_header = format!(

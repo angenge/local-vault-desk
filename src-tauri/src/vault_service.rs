@@ -776,12 +776,21 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
 
     /// 重启/启动本地流媒体微服务
     fn restart_stream_server(&self) {
+        let _ = self.restart_stream_server_with_lan(false);
+    }
+
+    /// 根据局域网开关启动或切换流媒体微服务 (allow_lan: true 监听 0.0.0.0, false 仅监听 127.0.0.1)
+    pub fn restart_stream_server_with_lan(&self, allow_lan: bool) -> Result<(), String> {
         self.stop_stream_server();
         let rclone_clone = self.rclone.clone();
-        if let Ok(server) = MediaStreamServer::start(move |path, start, len| {
+        match MediaStreamServer::start(allow_lan, move |path, start, len| {
             rclone_clone.read_file_range_bytes(path, start, len)
         }) {
-            *self.stream_server.lock().unwrap() = Some(server);
+            Ok(server) => {
+                *self.stream_server.lock().unwrap() = Some(server);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -792,17 +801,41 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         }
     }
 
-    /// 获取文件的本地安全流媒体 URL（带 127.0.0.1 + Token 鉴权）
-    pub fn get_stream_url(&self, remote_path: &str) -> Result<String, String> {
+    /// 获取文件的本地安全流媒体 URL（带 127.0.0.1 或 0.0.0.0 + Token 鉴权）
+    pub fn get_stream_url(&self, remote_path: &str, use_lan_ip: bool) -> Result<String, String> {
         let is_unlocked = self.status.lock().unwrap().is_unlocked;
         if !is_unlocked {
             return Err("保险箱尚未解锁".into());
         }
         let lock = self.stream_server.lock().unwrap();
         match lock.as_ref() {
-            Some(srv) => Ok(srv.get_stream_url(remote_path)),
+            Some(srv) => {
+                if use_lan_ip {
+                    Ok(srv.get_lan_stream_url(remote_path))
+                } else {
+                    Ok(srv.get_stream_url(remote_path))
+                }
+            }
             None => Err("流媒体服务未就绪".into()),
         }
+    }
+
+    /// 查询当前流媒体服务状态及局域网 IP
+    pub fn get_stream_server_status(&self) -> serde_json::Value {
+        let is_unlocked = self.status.lock().unwrap().is_unlocked;
+        let lock = self.stream_server.lock().unwrap();
+        let (running, port, is_lan) = match lock.as_ref() {
+            Some(srv) => (true, srv.port(), srv.is_lan_enabled()),
+            None => (false, 0, false),
+        };
+        let lan_ip = crate::stream_server::get_local_lan_ip();
+        serde_json::json!({
+            "is_unlocked": is_unlocked,
+            "running": running,
+            "port": port,
+            "is_lan": is_lan,
+            "lan_ip": lan_ip,
+        })
     }
 
     /// 取消当前正在进行的传输任务（导入/导出）

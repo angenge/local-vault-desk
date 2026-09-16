@@ -20,7 +20,10 @@ import {
   Copy,
   Check,
   ExternalLink,
-  Tv
+  Tv,
+  Wifi,
+  WifiOff,
+  Smartphone
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -37,9 +40,13 @@ const loading = ref(false)
 const errorMsg = ref('')
 const blobUrl = ref<string | null>(null)
 const streamUrl = ref<string | null>(null)
+const lanStreamUrl = ref<string | null>(null)
+const isLanEnabled = ref(false)
+const lanIp = ref<string | null>(null)
 const textContent = ref<string>('')
 const isCopied = ref(false)
 const isStreamCopied = ref(false)
+const isLanCopied = ref(false)
 const isExpanded = ref(false)
 const mediaDecodeError = ref(false)
 const isAudioOnlyPlaying = ref(false)
@@ -119,10 +126,12 @@ function cleanBlob() {
     blobUrl.value = null
   }
   streamUrl.value = null
+  lanStreamUrl.value = null
   textContent.value = ''
   errorMsg.value = ''
   isCopied.value = false
   isStreamCopied.value = false
+  isLanCopied.value = false
   mediaDecodeError.value = false
   isAudioOnlyPlaying.value = false
 }
@@ -131,17 +140,22 @@ async function loadPreview() {
   cleanBlob()
   if (!props.item || props.item.IsDir) return
 
-  // 1. 如果是音视频媒体，获取本地 127.0.0.1 安全流式播放 URL（支持在浏览器或外部播放器中流畅硬解播放）
+  // 1. 如果是音视频媒体，获取本地/局域网安全流式播放 URL
   if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
     try {
-      streamUrl.value = await tauriVault.getStreamUrl(props.item.Path)
+      const status = await tauriVault.getStreamServerStatus()
+      isLanEnabled.value = status.is_lan
+      lanIp.value = status.lan_ip
+      streamUrl.value = await tauriVault.getStreamUrl(props.item.Path, false)
+      if (status.is_lan) {
+        lanStreamUrl.value = await tauriVault.getStreamUrl(props.item.Path, true)
+      }
     } catch {}
   }
 
   // 2. 对于体积在 200MB 内的文件，加载内存 Blob 供弹窗内快速预览
   if (props.item.Size > MAX_PREVIEW_SIZE) {
     if (fileCategory.value === 'video' || fileCategory.value === 'audio') {
-      // 视频文件大体积可直接通过流媒体地址播放
       return
     }
     errorMsg.value = `该文件体积为 ${(props.item.Size / 1024 / 1024).toFixed(1)} MB，超出内存安全预览上限（200 MB）。为保障流畅性，请直接导出后查看。`
@@ -173,6 +187,34 @@ async function loadPreview() {
   } finally {
     loading.value = false
   }
+}
+
+async function toggleLanMode() {
+  if (!props.item) return
+  try {
+    const nextMode = !isLanEnabled.value
+    const status = await tauriVault.setStreamLanMode(nextMode)
+    isLanEnabled.value = status.is_lan
+    lanIp.value = status.lan_ip
+    streamUrl.value = await tauriVault.getStreamUrl(props.item.Path, false)
+    if (status.is_lan) {
+      lanStreamUrl.value = await tauriVault.getStreamUrl(props.item.Path, true)
+    } else {
+      lanStreamUrl.value = null
+    }
+  } catch {}
+}
+
+async function copyLanStreamLink() {
+  const url = lanStreamUrl.value || streamUrl.value
+  if (!url) return
+  try {
+    await navigator.clipboard.writeText(url)
+    isLanCopied.value = true
+    setTimeout(() => {
+      isLanCopied.value = false
+    }, 2000)
+  } catch {}
 }
 
 async function openInBrowser() {
@@ -259,8 +301,32 @@ async function copyText() {
         </div>
 
         <div class="flex items-center gap-1.5 shrink-0">
-          <!-- 外部播放器 / 浏览器串流按钮 -->
+          <!-- 局域网 / 外部播放器 / 浏览器串流按钮组 -->
           <template v-if="(fileCategory === 'video' || fileCategory === 'audio') && streamUrl">
+            <button
+              type="button"
+              @click="toggleLanMode"
+              class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 border shadow-sm"
+              :class="isLanEnabled ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-300' : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'"
+              :title="isLanEnabled ? '局域网共享已开启（手机/iPad可在同WiFi下直接观看）' : '开启局域网共享（允许手机/iPad在同WiFi下观看）'"
+            >
+              <Wifi v-if="isLanEnabled" class="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+              <WifiOff v-else class="w-3.5 h-3.5 text-slate-400" />
+              <span class="hidden lg:inline">{{ isLanEnabled ? '局域网已开' : '局域网共享' }}</span>
+            </button>
+
+            <button
+              v-if="isLanEnabled"
+              type="button"
+              @click="copyLanStreamLink"
+              class="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium transition flex items-center gap-1.5 shadow-sm"
+              :title="`复制局域网播放直链 (${lanIp || '192.168.x.x'})，可在手机/iPad浏览器或播放器打开`"
+            >
+              <Check v-if="isLanCopied" class="w-3.5 h-3.5 text-white" />
+              <Smartphone v-else class="w-3.5 h-3.5" />
+              <span class="hidden md:inline">{{ isLanCopied ? '已复制手机直链' : '手机/iPad直链' }}</span>
+            </button>
+
             <button
               type="button"
               @click="openInBrowser"
@@ -270,11 +336,12 @@ async function copyText() {
               <ExternalLink class="w-3.5 h-3.5 text-blue-400" />
               <span class="hidden md:inline">浏览器播放</span>
             </button>
+
             <button
               type="button"
               @click="copyStreamLink"
               class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition"
-              :title="isStreamCopied ? '已复制播放地址' : '复制流媒体直链 (可在 PotPlayer/VLC 中直接打开)'"
+              :title="isStreamCopied ? '已复制播放地址' : '复制本机流媒体直链 (可在 PotPlayer/VLC 中直接打开)'"
             >
               <Check v-if="isStreamCopied" class="w-4 h-4 text-emerald-400" />
               <Tv v-else class="w-4 h-4 text-cyan-400" />
@@ -406,6 +473,16 @@ async function copyText() {
                 在默认浏览器中打开
               </button>
               <button
+                v-if="isLanEnabled"
+                type="button"
+                @click="copyLanStreamLink"
+                class="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-xl transition shadow flex items-center gap-1.5"
+              >
+                <Check v-if="isLanCopied" class="w-3.5 h-3.5" />
+                <Smartphone v-else class="w-3.5 h-3.5" />
+                <span>{{ isLanCopied ? '已复制手机/iPad直链' : '复制手机/iPad直链' }}</span>
+              </button>
+              <button
                 v-if="streamUrl"
                 type="button"
                 @click="copyStreamLink"
@@ -413,7 +490,7 @@ async function copyText() {
               >
                 <Check v-if="isStreamCopied" class="w-3.5 h-3.5 text-emerald-400" />
                 <Tv v-else class="w-3.5 h-3.5 text-cyan-400" />
-                <span>{{ isStreamCopied ? '已复制直链' : '复制串流地址 (PotPlayer/VLC)' }}</span>
+                <span>{{ isStreamCopied ? '已复制直链' : '复制本机直链 (PotPlayer/VLC)' }}</span>
               </button>
               <button
                 type="button"

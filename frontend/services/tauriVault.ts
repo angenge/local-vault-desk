@@ -186,7 +186,15 @@ export const tauriVault = {
     return await invoke<number[]>('read_file_preview', data)
   },
 
-  async getStreamUrl(vaultItemPath: string): Promise<string> {
-    return await invoke<string>('get_stream_url', { vaultItemPath })
+  async getStreamUrl(vaultItemPath: string, useLanIp = false): Promise<string> {
+    return await invoke<string>('get_stream_url', { vaultItemPath, useLanIp })
+  },
+
+  async setStreamLanMode(allowLan: boolean): Promise<{ is_unlocked: boolean; running: boolean; port: number; is_lan: boolean; lan_ip: string | null }> {
+    return await invoke('set_stream_lan_mode', { allowLan })
+  },
+
+  async getStreamServerStatus(): Promise<{ is_unlocked: boolean; running: boolean; port: number; is_lan: boolean; lan_ip: string | null }> {
+    return await invoke('get_stream_server_status')
   }
 }

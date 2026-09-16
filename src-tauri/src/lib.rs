@@ -367,11 +367,37 @@ async fn read_file_preview(
 async fn get_stream_url(
     state: State<'_, SharedVault>,
     vault_item_path: String,
+    use_lan_ip: Option<bool>,
 ) -> Result<String, String> {
     let service = state.inner().clone();
-    tokio::task::spawn_blocking(move || service.get_stream_url(&vault_item_path))
+    let lan = use_lan_ip.unwrap_or(false);
+    tokio::task::spawn_blocking(move || service.get_stream_url(&vault_item_path, lan))
         .await
         .map_err(|e| format!("获取流媒体地址失败: {}", e))?
+}
+
+#[tauri::command]
+async fn set_stream_lan_mode(
+    state: State<'_, SharedVault>,
+    allow_lan: bool,
+) -> Result<serde_json::Value, String> {
+    let service = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        service.restart_stream_server_with_lan(allow_lan)?;
+        Ok::<serde_json::Value, String>(service.get_stream_server_status())
+    })
+    .await
+    .map_err(|e| format!("切换流媒体模式失败: {}", e))?
+}
+
+#[tauri::command]
+async fn get_stream_server_status(
+    state: State<'_, SharedVault>,
+) -> Result<serde_json::Value, String> {
+    let service = state.inner().clone();
+    Ok(tokio::task::spawn_blocking(move || service.get_stream_server_status())
+        .await
+        .map_err(|e| format!("查询流媒体状态失败: {}", e))?)
 }
 
 pub fn run() {
@@ -418,6 +444,8 @@ pub fn run() {
             cancel_transfer,
             read_file_preview,
             get_stream_url,
+            set_stream_lan_mode,
+            get_stream_server_status,
             get_interop_config,
             verify_interop,
             interop_self_verify
