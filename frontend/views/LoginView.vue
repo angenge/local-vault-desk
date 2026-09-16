@@ -227,23 +227,23 @@ async function handleSubmit() {
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 relative">
-    <div class="w-full max-w-md bg-slate-900/90 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur-md relative z-10">
+  <div class="h-screen w-screen overflow-y-auto flex items-center justify-center p-4 sm:p-6 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 relative">
+    <div class="w-full max-w-md bg-slate-900/90 border border-slate-800 rounded-3xl p-6 sm:p-7 shadow-2xl backdrop-blur-md relative z-10 my-auto">
       <!-- 标志与标题 -->
-      <div class="flex flex-col items-center text-center mb-8">
-        <div class="w-16 h-16 rounded-2xl bg-blue-600/10 border border-blue-500/20 flex items-center justify-center text-blue-500 mb-4 shadow-inner">
-          <FolderLock class="w-8 h-8" />
+      <div class="flex flex-col items-center text-center mb-5">
+        <div class="w-12 h-12 rounded-2xl bg-blue-600/10 border border-blue-500/20 flex items-center justify-center text-blue-500 mb-2.5 shadow-inner">
+          <FolderLock class="w-6 h-6" />
         </div>
-        <h1 class="text-2xl font-bold text-white tracking-tight">本地文件保险箱</h1>
-        <p class="text-xs text-slate-400 mt-1">金融级端到端本地加密存储</p>
+        <h1 class="text-xl font-bold text-white tracking-tight">本地文件保险箱</h1>
+        <p class="text-xs text-slate-400 mt-0.5">金融级端到端本地加密存储</p>
       </div>
 
       <!-- 模式切换标签 -->
-      <div class="flex bg-slate-950/60 p-1 rounded-xl border border-slate-800/80 mb-6">
+      <div class="flex bg-slate-950/60 p-1 rounded-xl border border-slate-800/80 mb-4">
         <button
           type="button"
           @click="switchMode('unlock')"
-          class="flex-1 py-2 text-xs font-semibold rounded-lg transition whitespace-nowrap"
+          class="flex-1 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap"
           :class="mode === 'unlock' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'"
         >
           解锁保险箱
@@ -251,7 +251,7 @@ async function handleSubmit() {
         <button
           type="button"
           @click="switchMode('create')"
-          class="flex-1 py-2 text-xs font-semibold rounded-lg transition whitespace-nowrap"
+          class="flex-1 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap"
           :class="mode === 'create' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'"
         >
           创建新保险箱
@@ -259,7 +259,7 @@ async function handleSubmit() {
       </div>
 
       <!-- 表单区域 -->
-      <form @submit.prevent="handleSubmit" class="space-y-4">
+      <form @submit.prevent="handleSubmit" class="space-y-3">
         <!-- 保险箱物理路径 -->
         <div>
           <div class="flex items-center justify-between mb-1.5">
@@ -416,14 +416,14 @@ async function handleSubmit() {
         <!-- 创建模式下主密码不可找回的安全告示 -->
         <div
           v-if="mode === 'create'"
-          class="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-xs text-amber-300 space-y-1"
+          class="p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-xl text-xs text-amber-300 space-y-0.5"
         >
-          <p class="font-semibold flex items-center gap-1.5">
+          <p class="font-semibold flex items-center gap-1.5 text-[11px]">
             <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
             主密码无法找回，请务必妥善保管
           </p>
-          <p class="text-amber-200/80 leading-relaxed">
-            本保险箱使用不可逆密钥派生加密，不设任何找回或重置通道。忘记主密码将导致全部数据永久无法解密，请先在安全位置备份密码。
+          <p class="text-amber-200/80 leading-relaxed text-[11px]">
+            本保险箱使用不可逆密钥派生加密，不设任何找回通道。忘记主密码将导致数据永久无法解密。
           </p>
         </div>
 
@@ -431,7 +431,7 @@ async function handleSubmit() {
         <button
           type="submit"
           :disabled="loading"
-          class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition shadow-lg shadow-blue-600/25 flex items-center justify-center gap-2 mt-6"
+          class="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition shadow-lg shadow-blue-600/25 flex items-center justify-center gap-2 mt-4"
         >
           <span v-if="loading">正在初始化加密通道...</span>
           <template v-else>
@@ -442,7 +442,7 @@ async function handleSubmit() {
       </form>
 
       <!-- 底层引擎指示灯 -->
-      <div class="mt-6 pt-4 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500 select-none">
+      <div class="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500 select-none">
         <span class="flex items-center gap-2">
           <span class="relative flex h-2 w-2">
             <span
