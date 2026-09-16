@@ -36,6 +36,12 @@ const blobUrl = ref<string | null>(null)
 const textContent = ref<string>('')
 const isCopied = ref(false)
 const isExpanded = ref(false)
+const mediaDecodeError = ref(false)
+const videoRef = ref<HTMLVideoElement | null>(null)
+
+function handleMediaError() {
+  mediaDecodeError.value = true
+}
 
 // 200 MB 预览体积熔断保护（放宽至 200MB，支持绝大多数常见音频/视频/文档）
 const MAX_PREVIEW_SIZE = 200 * 1024 * 1024
@@ -101,6 +107,7 @@ function cleanBlob() {
   textContent.value = ''
   errorMsg.value = ''
   isCopied.value = false
+  mediaDecodeError.value = false
 }
 
 async function loadPreview() {
@@ -301,13 +308,30 @@ async function copyText() {
         </div>
 
         <!-- 3. 视频预览 -->
-        <div v-else-if="fileCategory === 'video' && blobUrl" class="w-full h-full flex items-center justify-center">
+        <div v-else-if="fileCategory === 'video' && blobUrl" class="w-full h-full flex flex-col items-center justify-center relative">
           <video
+            ref="videoRef"
             :src="blobUrl"
             controls
-            autoplay
+            playsinline
+            preload="auto"
             class="max-w-full max-h-full rounded-xl shadow-lg bg-black"
+            @error="handleMediaError"
           ></video>
+          <div v-if="mediaDecodeError" class="absolute inset-0 bg-slate-900/90 flex flex-col items-center justify-center p-6 text-center space-y-3 rounded-xl">
+            <AlertCircle class="w-10 h-10 text-amber-400" />
+            <h4 class="text-sm font-semibold text-white">当前系统解码器不支持该视频编码</h4>
+            <p class="text-xs text-slate-400 max-w-sm leading-relaxed">
+              该视频可能使用了 HEVC/H.265 或特殊的封装格式，当前 WebView2 无法直接硬件解码。建议导出后使用本地播放器（如 PotPlayer / VLC）查看。
+            </p>
+            <button
+              type="button"
+              @click="emit('export', item)"
+              class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl transition shadow"
+            >
+              解密并导出到本地播放
+            </button>
+          </div>
         </div>
 
         <!-- 4. 音频预览 -->
@@ -319,7 +343,8 @@ async function copyText() {
             <h4 class="text-sm font-semibold text-white">{{ item.Name }}</h4>
             <p class="text-xs text-slate-400 mt-1">{{ formatSize(item.Size) }}</p>
           </div>
-          <audio :src="blobUrl" controls autoplay class="w-72 sm:w-96"></audio>
+          <audio :src="blobUrl" controls preload="auto" class="w-72 sm:w-96" @error="handleMediaError"></audio>
+          <p v-if="mediaDecodeError" class="text-xs text-amber-400">当前系统音频格式解码失败，建议导出后播放</p>
         </div>
 
         <!-- 5. PDF 预览 -->
