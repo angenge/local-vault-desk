@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import { tauriVault } from '@/services/tauriVault'
 import type { RcloneItem } from '@/types'
@@ -23,8 +23,10 @@ import {
   Tv,
   Wifi,
   WifiOff,
-  Smartphone
+  Smartphone,
+  QrCode
 } from 'lucide-vue-next'
+import QRCode from 'qrcode'
 
 const props = defineProps<{
   show: boolean
@@ -51,6 +53,9 @@ const isExpanded = ref(false)
 const mediaDecodeError = ref(false)
 const isAudioOnlyPlaying = ref(false)
 const videoRef = ref<HTMLVideoElement | null>(null)
+const showQr = ref(false)
+const qrDataUrl = ref<string | null>(null)
+const qrError = ref('')
 
 function handleMediaError() {
   mediaDecodeError.value = true
@@ -134,6 +139,9 @@ function cleanBlob() {
   isLanCopied.value = false
   mediaDecodeError.value = false
   isAudioOnlyPlaying.value = false
+  showQr.value = false
+  qrDataUrl.value = null
+  qrError.value = ''
 }
 
 async function loadPreview() {
@@ -221,6 +229,48 @@ async function copyLanStreamLink() {
   } catch {}
 }
 
+// 生成局域网播放二维码：扫码即开，免去手机端手动粘贴长 URL（含 Token）
+async function openQrCode() {
+  const url = lanStreamUrl.value || streamUrl.value
+  if (!url) return
+  showQr.value = true
+  qrError.value = ''
+  qrDataUrl.value = null
+  try {
+    qrDataUrl.value = await QRCode.toDataURL(url, {
+      errorCorrectionLevel: 'M',
+      margin: 1,
+      width: 384,
+      color: { dark: '#111827', light: '#ffffff' }
+    })
+  } catch {
+    qrError.value = '二维码生成失败，请改用下方直链复制后发送到手机打开'
+  }
+}
+
+function closeQrCode() {
+  showQr.value = false
+  qrDataUrl.value = null
+  qrError.value = ''
+}
+
+function handleQrKeydown(event: KeyboardEvent) {
+  if (showQr.value && event.key === 'Escape') {
+    event.stopPropagation()
+    closeQrCode()
+  }
+}
+
+onMounted(() => {
+  // 捕获阶段优先处理：QR 弹窗开启时 Esc 仅关闭二维码，不连带关闭预览
+  window.addEventListener('keydown', handleQrKeydown, { capture: true })
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleQrKeydown, { capture: true })
+  cleanBlob()
+})
+
 async function openInBrowser() {
   if (!streamUrl.value) return
   try {
@@ -250,10 +300,6 @@ watch(
     }
   }
 )
-
-onUnmounted(() => {
-  cleanBlob()
-})
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -329,6 +375,17 @@ async function copyText() {
               <Check v-if="isLanCopied" class="w-3.5 h-3.5 text-white" />
               <Smartphone v-else class="w-3.5 h-3.5" />
               <span class="hidden md:inline">{{ isLanCopied ? '已复制手机直链' : '手机/iPad直链' }}</span>
+            </button>
+
+            <button
+              v-if="isLanEnabled && (lanStreamUrl || streamUrl)"
+              type="button"
+              @click="openQrCode"
+              class="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-emerald-300 rounded-lg text-xs font-medium transition flex items-center gap-1.5 border border-emerald-500/30"
+              title="生成扫码播放二维码，手机/iPad 扫码即可在浏览器中打开"
+            >
+              <QrCode class="w-3.5 h-3.5 text-emerald-400" />
+              <span class="hidden md:inline">扫码播放</span>
             </button>
 
             <button
@@ -492,6 +549,15 @@ async function copyText() {
                 <span>{{ isLanCopied ? '已复制手机/iPad直链' : '复制手机/iPad直链' }}</span>
               </button>
               <button
+                v-if="isLanEnabled"
+                type="button"
+                @click="openQrCode"
+                class="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-emerald-300 text-xs font-semibold rounded-xl transition shadow border border-emerald-500/30 flex items-center gap-1.5"
+              >
+                <QrCode class="w-3.5 h-3.5 text-emerald-400" />
+                手机扫码播放
+              </button>
+              <button
                 v-if="streamUrl"
                 type="button"
                 @click="copyStreamLink"
@@ -549,6 +615,52 @@ async function copyText() {
           <span>安全环境：关闭此弹窗将立即覆写销毁内存句柄</span>
         </span>
         <span class="text-slate-600">按 Esc 或空格键关闭</span>
+      </div>
+    </div>
+
+    <!-- 手机扫码播放弹窗 -->
+    <div
+      v-if="showQr"
+      class="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+      @click.self="closeQrCode"
+    >
+      <div class="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-sm p-6 flex flex-col items-center gap-4">
+        <div class="flex items-center justify-between w-full">
+          <h4 class="text-sm font-semibold text-white flex items-center gap-2">
+            <QrCode class="w-4 h-4 text-emerald-400" />
+            手机扫码播放
+          </h4>
+          <button type="button" @click="closeQrCode" class="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition" title="关闭扫码">
+            <X class="w-4 h-4" />
+          </button>
+        </div>
+
+        <div class="rounded-2xl bg-white p-3 shadow-lg">
+          <img v-if="qrDataUrl" :src="qrDataUrl" alt="扫码播放二维码" class="w-64 h-64" />
+          <div v-else class="w-64 h-64 flex items-center justify-center">
+            <Loader2 v-if="!qrError" class="w-8 h-8 animate-spin text-blue-500" />
+            <AlertCircle v-else class="w-10 h-10 text-amber-400" />
+          </div>
+        </div>
+
+        <p v-if="qrError" class="text-xs text-amber-400 text-center">{{ qrError }}</p>
+        <p v-else class="text-xs text-slate-400 text-center leading-relaxed">
+          使用手机相机 / 微信「扫一扫」扫描，<br />
+          保持手机与电脑在同一 WiFi 下即可直接播放
+        </p>
+        <p class="text-[11px] text-slate-500 truncate w-full text-center" :title="lanStreamUrl || streamUrl || ''">
+          {{ lanStreamUrl || streamUrl || '' }}
+        </p>
+
+        <button
+          type="button"
+          @click="copyLanStreamLink"
+          class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-xl transition flex items-center justify-center gap-1.5"
+        >
+          <Check v-if="isLanCopied" class="w-3.5 h-3.5" />
+          <Copy v-else class="w-3.5 h-3.5" />
+          {{ isLanCopied ? '已复制直链' : '复制直链（扫码失败时兜底）' }}
+        </button>
       </div>
     </div>
   </div>
