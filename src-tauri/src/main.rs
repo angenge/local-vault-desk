@@ -921,7 +921,57 @@ fn run_bugfix_regression_test() {
             assert!(buf.starts_with("HTTP/1.1 416"), "越界 Range 必须回 416，实际首行: {}", buf.lines().next().unwrap_or(""));
         }
 
-        println!("  -> 端到端 HTTP 协议级验证通过：200 / 206 / HEAD / 416 均符合预期");
+        // 5. 显式终点 Range 分块下发（防 OOM 回归）：9MB 文件请求 0-5MB 区间，
+        //    必须 206 + 精确 Content-Range + 全长下发（旧实现会把整段一次性读入内存）
+        {
+            let big_remote = "sub_work/big_range.bin";
+            let big_local = base_dir.join("big_range.bin");
+            std::fs::write(&big_local, vec![0xABu8; 9 * 1024 * 1024]).expect("生成大文件失败");
+            service
+                .import_paths(vec![big_local.to_string_lossy().to_string()], "sub_work")
+                .expect("导入大文件失败");
+
+            let token_param = fresh_url.split('?').nth(1).expect("提取 token");
+            let req = format!(
+                "GET /stream/{}?{} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-5242879\r\nConnection: close\r\n\r\n",
+                big_remote, token_param, host
+            );
+            let mut s = std::net::TcpStream::connect(host).expect("连接流媒体服务");
+            s.write_all(req.as_bytes()).unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).unwrap();
+            let text = String::from_utf8_lossy(&raw);
+            let first = text.lines().next().unwrap_or("");
+            assert!(first.starts_with("HTTP/1.1 206"), "显式终点大区间必须回 206，实际: {}", first);
+            assert!(
+                text.contains("Content-Range: bytes 0-5242879/9437184"),
+                "Content-Range 必须精确回填，实际: {}",
+                text.lines().find(|l| l.to_lowercase().starts_with("content-range")).unwrap_or("")
+            );
+            let split = text.find("\r\n\r\n").unwrap();
+            let body = &raw[split + 4..];
+            assert_eq!(body.len(), 5242880, "必须返回请求的完整 5MB 区间");
+            assert_eq!(&body[..16], &[0xABu8; 16], "正文头部字节应一致");
+            assert_eq!(&body[body.len() - 16..], &[0xABu8; 16], "正文尾部字节应一致");
+
+            // 开放终点 Range(bytes=N-) 保持有界：不应把剩余文件全量下发
+            let req2 = format!(
+                "GET /stream/{}?{} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n",
+                big_remote, token_param, host
+            );
+            let mut s2 = std::net::TcpStream::connect(host).expect("连接流媒体服务");
+            s2.write_all(req2.as_bytes()).unwrap();
+            let mut raw2 = Vec::new();
+            s2.read_to_end(&mut raw2).unwrap();
+            let text2 = String::from_utf8_lossy(&raw2);
+            let first2 = text2.lines().next().unwrap_or("");
+            assert!(first2.starts_with("HTTP/1.1 206"), "开放终点必须回 206，实际: {}", first2);
+            let split2 = text2.find("\r\n\r\n").unwrap();
+            let body2 = &raw2[split2 + 4..];
+            assert!(body2.len() <= 4 * 1024 * 1024, "开放终点 Range 必须保持 4MB 有界，实际下发 {}", body2.len());
+        }
+
+        println!("  -> 端到端 HTTP 协议级验证通过：200 / 206 / HEAD / 416 / 大区间分块均符合预期");
     }
 
     println!("-> 验证通过：本地流媒体微服务与 0.0.0.0 局域网模式切换验证成功！");
