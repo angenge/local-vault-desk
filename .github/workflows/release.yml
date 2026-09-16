@@ -70,8 +70,6 @@ jobs:
           $webview2Dir = Get-ChildItem -Path "src-tauri/target" -Filter "WebView2Loader.dll" -Recurse | Select-Object -First 1
           if ($webview2Dir) {
             Copy-Item -LiteralPath $webview2Dir.FullName -Destination "$portableDir/WebView2Loader.dll" -Force
-            # 同时也复制到主 target release 目录，供测试步骤直接运行
-            Copy-Item -LiteralPath $webview2Dir.FullName -Destination "src-tauri/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll" -Force
           }
           Compress-Archive -Path "$portableDir/*" -DestinationPath "dist-portable/LocalVaultDesk_${ver}_Portable_x64.zip" -Force
 
