@@ -839,6 +839,14 @@ fn run_bugfix_regression_test() {
     assert!(sub_export_dir.join("normal_audit.txt").exists(), "子目录文件必须成功导出");
     println!("-> 验证通过：子目录条目 path 规范化为全局相对路径，导出与操作无缝衔接！");
 
+    // 7. 验证内存安全预览接口与体积熔断保护
+    println!("\n7. 验证内存流式预览接口与体积熔断...");
+    let preview_bytes = service.read_file_preview("sub_work/normal_audit.txt", 1024 * 1024).expect("预览应成功");
+    assert_eq!(preview_bytes, b"some text", "预览数据应完全一致");
+    let oom_err = service.read_file_preview("sub_work/normal_audit.txt", 4);
+    assert!(oom_err.is_err(), "超限体积必须被拦截拒绝");
+    println!("-> 验证通过：内存流式安全预览与熔断限制机制工作正常！");
+
     service.lock_vault();
     service.stop();
     let _ = fs::remove_dir_all(&base_dir);

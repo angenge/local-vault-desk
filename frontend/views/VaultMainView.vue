@@ -9,6 +9,7 @@ import Breadcrumb from '@/components/Breadcrumb.vue'
 import ImportNoticeModal from '@/components/ImportNoticeModal.vue'
 import TransferProgressModal from '@/components/TransferProgressModal.vue'
 import VaultToolsPanel from '@/components/VaultToolsPanel.vue'
+import FilePreviewModal from '@/components/FilePreviewModal.vue'
 import {
   Lock,
   Upload,
@@ -28,7 +29,8 @@ import {
   Scissors,
   Copy,
   ClipboardPaste,
-  Wrench
+  Wrench,
+  Eye
 } from 'lucide-vue-next'
 import type { RcloneItem, SearchHit, TransferProgress } from '@/types'
 
@@ -50,6 +52,33 @@ const showTools = ref(false)
 const recycleCount = ref(0)
 const clipboard = ref<{ mode: 'cut' | 'copy'; paths: string[] } | null>(null)
 const lastSelectedIdx = ref<number>(-1)
+
+// ===== 文件安全预览状态 =====
+const previewModal = ref<{
+  show: boolean
+  item: RcloneItem | null
+}>({
+  show: false,
+  item: null
+})
+
+function openPreview(item: RcloneItem) {
+  if (item.IsDir) return
+  previewModal.value = {
+    show: true,
+    item
+  }
+}
+
+function closePreview() {
+  previewModal.value.show = false
+  previewModal.value.item = null
+}
+
+function onPreviewExport(item: RcloneItem) {
+  selectedItems.value = [item]
+  handleExport()
+}
 
 function hitToItem(hit: SearchHit): RcloneItem {
   return {
@@ -119,6 +148,11 @@ function handleBlankContextMenu(event: MouseEvent) {
 
 function handleGlobalKeyDown(event: KeyboardEvent) {
   markActivity()
+  if (previewModal.value.show && (event.key === 'Escape' || event.key === ' ')) {
+    event.preventDefault()
+    closePreview()
+    return
+  }
   if (contextMenu.value.show && event.key === 'Escape') {
     closeContextMenu()
     return
@@ -128,6 +162,13 @@ function handleGlobalKeyDown(event: KeyboardEvent) {
   if (tag === 'input' || tag === 'textarea') return
 
   if (isTransferring.value || vaultStore.loading) return
+
+  // 空格键快速预览选中文件 (类似 macOS QuickLook)
+  if (event.key === ' ' && selectedItems.value.length === 1 && !selectedItems.value[0].IsDir) {
+    event.preventDefault()
+    openPreview(selectedItems.value[0])
+    return
+  }
 
   // Ctrl+A / Cmd+A 全选
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
@@ -614,6 +655,9 @@ function handleItemDblClick(item: RcloneItem) {
     vaultStore.navigateTo(item.Path)
     selectedItems.value = []
     lastSelectedIdx.value = -1
+  } else {
+    // 双击非目录文件直接打开安全预览
+    openPreview(item)
   }
 }
 
@@ -1211,6 +1255,14 @@ function onEnterSearch() {
       @busy="toolsBusy = $event"
     />
 
+    <!-- 文件安全预览弹窗（零落盘 / 内存流式解密） -->
+    <FilePreviewModal
+      :show="previewModal.show"
+      :item="previewModal.item"
+      @close="closePreview"
+      @export="onPreviewExport"
+    />
+
     <!-- 右键上下文快捷菜单 -->
     <div
       v-if="contextMenu.show"
@@ -1221,6 +1273,19 @@ function onEnterSearch() {
     >
       <!-- 1. 针对条目（单选 / 多选）的右键菜单 -->
       <template v-if="contextMenu.target === 'item'">
+        <button
+          v-if="selectedItems.length === 1 && !selectedItems[0].IsDir"
+          @click="openPreview(selectedItems[0])"
+          :disabled="isTransferring || vaultStore.loading"
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-slate-200 hover:bg-blue-600 hover:text-white transition group disabled:opacity-40"
+        >
+          <span class="flex items-center gap-2">
+            <Eye class="w-3.5 h-3.5 text-cyan-400 group-hover:text-white" />
+            <span>预览文件</span>
+          </span>
+          <span class="text-[10px] text-slate-500 group-hover:text-blue-200 font-mono">Space</span>
+        </button>
+
         <button
           @click="handleExport"
           :disabled="isExporting || isTransferring || vaultStore.loading"

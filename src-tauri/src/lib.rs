@@ -349,6 +349,19 @@ async fn cancel_transfer(state: State<'_, SharedVault>) -> Result<(), String> {
         .map_err(|e| format!("取消失败: {}", e))?
 }
 
+#[tauri::command]
+async fn read_file_preview(
+    state: State<'_, SharedVault>,
+    vault_item_path: String,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    let limit = max_bytes.unwrap_or(20 * 1024 * 1024); // 默认限制 20MB
+    let service = state.inner().clone();
+    tokio::task::spawn_blocking(move || service.read_file_preview(&vault_item_path, limit))
+        .await
+        .map_err(|e| format!("预览任务异常: {}", e))?
+}
+
 pub fn run() {
     let vault_service = Arc::new(VaultService::new());
     let vs_clone = vault_service.clone();
@@ -391,6 +404,7 @@ pub fn run() {
             get_stats,
             get_audit_log,
             cancel_transfer,
+            read_file_preview,
             get_interop_config,
             verify_interop,
             interop_self_verify

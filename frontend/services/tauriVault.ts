@@ -179,5 +179,10 @@ export const tauriVault = {
 
   async interopSelfVerify(): Promise<InteropSelfVerify> {
     return await invoke<InteropSelfVerify>('interop_self_verify')
+  },
+
+  // ===== 内存安全文件预览 =====
+  async readFilePreview(data: { vaultItemPath: string; maxBytes?: number }): Promise<number[]> {
+    return await invoke<number[]>('read_file_preview', data)
   }
 }

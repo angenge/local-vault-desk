@@ -546,6 +546,54 @@ impl RcloneService {
         read_res
     }
 
+    /// 读取文件二进制字节数据（用于安全预览，读取后立即销毁临时文件并限制最大体积）
+    pub fn read_file_bytes(&self, remote_path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let clean_path = remote_path.trim_start_matches('/');
+        let temp_dir = private_tmp_dir();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_file = temp_dir.join(format!("_vault_preview_{}_{}.tmp", std::process::id(), ts));
+
+        let dst_dir = temp_file
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| "".to_string());
+        let dst_file = temp_file
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "_vault_preview.tmp".to_string());
+
+        let res = self.call_rc(
+            "operations/copyfile",
+            serde_json::json!({
+                "srcFs": "vault_crypt:",
+                "srcRemote": clean_path,
+                "dstFs": dst_dir,
+                "dstRemote": dst_file
+            }),
+        );
+
+        let read_res = match res {
+            Ok(_) => {
+                let meta = fs::metadata(&temp_file).map_err(|e| e.to_string())?;
+                if meta.len() as usize > max_bytes {
+                    Err(format!(
+                        "文件体积 ({} MB) 超出预览上限 ({} MB)，请直接使用导出功能查看",
+                        meta.len() / 1024 / 1024,
+                        max_bytes / 1024 / 1024
+                    ))
+                } else {
+                    fs::read(&temp_file).map_err(|e| e.to_string())
+                }
+            }
+            Err(e) => Err(e),
+        };
+        let _ = fs::remove_file(&temp_file);
+        read_res
+    }
+
     fn run_async_job(&self, task_type: &str, endpoint: &str, params: serde_json::Value) -> Result<(), String> {
         self.run_async_job_full(task_type, endpoint, params, None, None)
     }

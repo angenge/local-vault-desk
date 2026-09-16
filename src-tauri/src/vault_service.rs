@@ -711,6 +711,18 @@ r#"1) 在外部 rclone 的 rclone.conf 中粘贴上面的 [interop_crypt] 段（
         self.rclone.get_stats()
     }
 
+    /// 读取文件二进制用于安全预览（带体积熔断限制）
+    pub fn read_file_preview(&self, vault_item_path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let is_unlocked = self.status.lock().unwrap().is_unlocked;
+        if !is_unlocked {
+            return Err("保险箱尚未解锁".into());
+        }
+        if is_internal_control(vault_item_path) {
+            return Err("内部管控文件不可预览".into());
+        }
+        self.rclone.read_file_bytes(vault_item_path, max_bytes)
+    }
+
     /// 取消当前正在进行的传输任务（导入/导出）
     pub fn cancel_transfer(&self) -> Result<(), String> {
         self.rclone.cancel_transfer()
