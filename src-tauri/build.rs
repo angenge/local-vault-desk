@@ -15,6 +15,9 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=winmm");
     println!("cargo:rustc-link-lib=dylib=bcrypt");
     println!("cargo:rustc-link-lib=dylib=ntdll");
+    println!("cargo:rustc-link-lib=dylib=advapi32");
+    println!("cargo:rustc-link-lib=dylib=shell32");
+    println!("cargo:rustc-link-lib=dylib=ole32");
 
     println!("cargo:rerun-if-changed=lib/librclone.a");
     println!("cargo:rerun-if-changed=../dist");

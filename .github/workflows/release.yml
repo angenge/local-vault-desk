@@ -29,17 +29,16 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: 'src-tauri/librclone_src/go.sum'
 
-      - name: Setup Rust toolchain (GNU)
+      - name: Setup Rust toolchain (MSVC)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-gnu
-          targets: x86_64-pc-windows-gnu
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
 
-      - name: Install MinGW / GCC
+      - name: Install MinGW / GCC (for Go C-Archive build)
         run: |
           choco install mingw -y --no-progress
           echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "RC=windres" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build librclone.a C-Archive
         run: |
@@ -54,9 +53,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Build Tauri Desktop Application
+      - name: Build Tauri Desktop Application (MSVC Static WebView2)
         run: |
-          npm run tauri -- build --target x86_64-pc-windows-gnu
+          npm run tauri -- build --target x86_64-pc-windows-msvc
 
       - name: Create Portable Bundle
         run: |
@@ -64,24 +63,16 @@ jobs:
           if (-not $ver) { $ver = "v1.0.0" }
           $portableDir = "dist-portable/LocalVaultDesk_Portable"
           New-Item -ItemType Directory -Path $portableDir -Force
-          Copy-Item -LiteralPath "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" -Destination "$portableDir/LocalVaultDesk.exe" -Force
-          
-          # 下载官方官方 WebView2Loader.dll 纳入便携包
-          $dllUrl = "https://raw.githubusercontent.com/angenge/local-vault-desk/main/src-tauri/target/release/WebView2Loader.dll"
-          # 从微软 NuGet 或通过源码构建目录获取
-          $webview2Dir = Get-ChildItem -Path "src-tauri/target" -Filter "WebView2Loader.dll" -Recurse | Select-Object -First 1
-          if ($webview2Dir) {
-            Copy-Item -LiteralPath $webview2Dir.FullName -Destination "$portableDir/WebView2Loader.dll" -Force
-          }
+          Copy-Item -LiteralPath "src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe" -Destination "$portableDir/LocalVaultDesk.exe" -Force
           Compress-Archive -Path "$portableDir/*" -DestinationPath "dist-portable/LocalVaultDesk_${ver}_Portable_x64.zip" -Force
 
       - name: Run Test Verification
         run: |
-          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-cli
-          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-features
-          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-security
-          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-fuzz
-          & "src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe" --test-fix-regression
+          & "src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe" --test-cli
+          & "src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe" --test-features
+          & "src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe" --test-security
+          & "src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe" --test-fuzz
+          & "src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe" --test-fix-regression
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -89,7 +80,7 @@ jobs:
         with:
           files: |
             dist-portable/*.zip
-            src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*.exe
-            src-tauri/target/x86_64-pc-windows-gnu/release/bundle/msi/*.msi
-            src-tauri/target/x86_64-pc-windows-gnu/release/local_vault_desk.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/local_vault_desk.exe
           generate_release_notes: true
