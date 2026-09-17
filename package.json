@@ -1,6 +1,6 @@
 {
   "name": "local-vault-desk",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "LocalVaultDesk - 本地文件保险箱 (基于 Rclone crypt 与 Tauri 2.0)",
   "type": "module",
   "scripts": {
