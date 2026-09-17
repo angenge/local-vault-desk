@@ -30,7 +30,8 @@ import {
   Copy,
   ClipboardPaste,
   Wrench,
-  Eye
+  Eye,
+  AlertCircle
 } from 'lucide-vue-next'
 import type { RcloneItem, SearchHit, TransferProgress } from '@/types'
 
@@ -148,9 +149,13 @@ function handleBlankContextMenu(event: MouseEvent) {
 
 function handleGlobalKeyDown(event: KeyboardEvent) {
   markActivity()
-  if (previewModal.value.show && (event.key === 'Escape' || event.key === ' ')) {
-    event.preventDefault()
-    closePreview()
+  if (previewModal.value.show) {
+    if (event.key === 'Escape' || event.key === ' ') {
+      event.preventDefault()
+      closePreview()
+    }
+    // 预览弹窗打开时阻止全局快捷键（如 Ctrl+C/X/V/Delete 等）穿透到底层文件列表，
+    // 避免劫持预览窗口内的文字复制或误删底层选中文件
     return
   }
   if (contextMenu.value.show && event.key === 'Escape') {
@@ -1173,9 +1178,29 @@ function onEnterSearch() {
           </tbody>
         </table>
 
-        <!-- 空目录提示 -->
+        <!-- 加载失败错误提示 -->
         <div
-          v-if="!vaultStore.loading && vaultStore.files.length === 0"
+          v-if="!vaultStore.loading && vaultStore.errorMsg"
+          class="flex flex-col items-center justify-center text-slate-500 py-16"
+        >
+          <AlertCircle class="w-16 h-16 text-red-500/70 mb-3" />
+          <div class="text-sm font-medium text-red-400">
+            加载目录失败
+          </div>
+          <p class="text-xs text-slate-500 mt-1 max-w-md text-center">{{ vaultStore.errorMsg }}</p>
+          <button
+            type="button"
+            @click="vaultStore.refreshFiles"
+            class="mt-4 px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition flex items-center gap-1.5"
+          >
+            <RefreshCw class="w-3.5 h-3.5" />
+            重试
+          </button>
+        </div>
+
+        <!-- 正常空目录提示 -->
+        <div
+          v-else-if="!vaultStore.loading && vaultStore.files.length === 0"
           class="flex flex-col items-center justify-center text-slate-500 py-16"
         >
           <ShieldCheck class="w-16 h-16 text-slate-700 mb-3" />

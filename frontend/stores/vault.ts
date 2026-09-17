@@ -48,8 +48,9 @@ export const useVaultStore = defineStore('vault', () => {
     loading.value = true
     errorMsg.value = ''
     try {
-      files.value = await tauriVault.listFiles(currentDir.value)
+      const res = await tauriVault.listFiles(currentDir.value)
       if (seq !== filesSeq) return // 已有更新的请求，本次结果已过期
+      files.value = res
       await checkEngine()
     } catch (err: any) {
       if (seq !== filesSeq) return
